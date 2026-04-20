@@ -1,10 +1,11 @@
 """
     Executors run the actual work for a Transition (LLM call, tool, judge)
-    Subtype AbstractExecutor and extend Peven.execute(executor, tid, tokens) to use your own
+    Subtype AbstractExecutor and extend Peven.execute(executor, tid, tokens) to use your own.
+    Executors may return one token or a vector of tokens.
 """
 abstract type AbstractExecutor end
 
-execute(e::AbstractExecutor, tid::Symbol, tokens::Vector{<:AbstractToken})::AbstractToken =
+execute(e::AbstractExecutor, tid::Symbol, tokens::Vector{<:AbstractToken}) =
     error("implement execute(::$(typeof(e)), ...)")
 
 const EXECUTOR_REGISTRY = Dict{Symbol, AbstractExecutor}()

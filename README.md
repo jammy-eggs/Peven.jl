@@ -12,8 +12,6 @@ Named after Peven of Aum from Patricia A. McKillip's Riddle-Master trilogy. Ridd
 
 3. What matters in serious evaluations is the shape of interaction: who sees what, in what order, what actions they can take, and how we judge those actions across individual or shared states. Peven favors radical explicitness: evaluation work should never hide inside implicit assumptions.
 
-This Julia port is a ground-up rewrite of my original python package optimized around concrete-token fast paths, copy-on-write marking semantics, and precomputed indexes from the Petri net model checking literature. It is the core of Peven, the engine, no extra fat.
-
 ## Install
 
 ```julia
@@ -60,7 +58,7 @@ issues = validate(net, marking)
 - **Tokens** -- colored data flowing through the net. Each token has a `color` label and a `run_key` for batch isolation.
 - **Marking** -- the distribution of tokens across places at a point in time.
 - **Guards** -- functions on transitions that gate firing. A guard that returns false blocks the transition for that run_key.
-- **Firing rule** -- a transition is hot when every input place has enough tokens of the same run_key for the arc weight. Firing grabs those tokens eagerly (reservation), spawns the executor, and drops outputs on completion. Only transitions affected by the marking change are rechecked (incremental enablement).
+- **Firing rule** -- a transition is hot when every input place has enough tokens of the same run_key for the arc weight. Firing grabs those tokens eagerly (reservation), spawns the executor, and drops outputs on completion. The same `(transition, run_key)` may overlap when enough tokens exist. Only transitions affected by the marking change are rechecked (incremental enablement).
 
 ## Engine API
 
@@ -73,6 +71,7 @@ issues = validate(net, marking)
 | `take(marking, net, tid, rk)` | Same as `grab`, but throws `ArgumentError` instead of returning `nothing` |
 | `fire(net, marking; ...)` | Run the engine to completion and return `Vector{RunResult}` |
 | `drop(marking, net, tid, token)` | Deposit output token into output places |
+| `drop(marking, net, tid, outputs)` | Deposit many output tokens into one output place |
 | `misfire(marking, consumed)` | Return consumed tokens after executor failure |
 
 ## Performance
@@ -83,6 +82,14 @@ Peven uses precomputed per-transition influence sets (LoLA 2's incremental enabl
 
 Transitions look up executors by their `executor::Symbol` in a process-global registry.
 For custom executors, subtype `AbstractExecutor`, extend `Peven.execute`, and register an instance with `register_executor!`.
+Executors may return one token or a vector of tokens. Vector outputs are valid only for transitions with exactly one output arc of weight `1`.
+`fire` now treats retries as new launches for fuse accounting, and event / trace records expose `firing_id` plus `attempt` metadata for each firing.
+
+## Events and traces
+
+`TransitionStarted`, `TransitionCompleted`, and `TransitionFailed` are emitted through `on_event`.
+Completed events and `TransitionResult`s now carry `outputs::Vector{T}` so scalar and vector executor returns share one shape.
+Each firing also has a stable `firing_id`, and retries increment `attempt` while keeping the same `firing_id`.
 
 ## Validation
 

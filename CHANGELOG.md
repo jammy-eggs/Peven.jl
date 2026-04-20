@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.2.0
+
+- Allow overlapping firings of the same `(transition, run_key)` when enough input tokens exist
+- Add vector executor outputs for transitions with exactly one output arc of weight `1`
+- Track `firing_id` and `attempt` across events and terminal trace records
+- Keep retry inputs reserved across attempts, while restoring the marking if fuse exhaustion blocks a retry
+- Clarify fuse semantics: it now counts launches, including retries, while letting in-flight work drain
+
 ## v0.1.0
 
 - Colored Petri net core: Places, Transitions, Arcs, Tokens, Markings
