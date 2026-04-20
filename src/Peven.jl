@@ -6,7 +6,7 @@ export Place, Transition, AbstractArc, ArcFrom, ArcTo, Net
 export ValidationIssue, validate
 export AbstractExecutor, FunctionExecutor
 export register_executor!, get_executor
-export EngineEvent, TransitionStarted, TransitionCompleted, TransitionFailed, RunFinished
+export EngineEvent, TransitionStarted, TransitionCompleted, TransitionFailed, GuardErrored, RunFinished
 export TransitionResult, RunResult
 export hot, cold, grab, take, drop, misfire, fire
 export fuses, evaluate_guard, emit

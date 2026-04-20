@@ -41,6 +41,16 @@ struct TransitionFailed <: EngineEvent
     retrying::Bool
 end
 
+"""
+    Emitted when a guard throws during enablement evaluation
+    Guard exceptions are scheduler observations, not launched firings
+"""
+struct GuardErrored <: EngineEvent
+    transition_id::Symbol
+    run_key::String
+    error::String
+end
+
 @inline emit(::Nothing, _) = nothing
 @inline emit(hook, event) = hook(event)
 
@@ -48,7 +58,7 @@ end
     Record of a terminal transition outcome kept in a run trace
     status is :completed or :failed
     outputs holds the executor's pre-fan-out outputs on success, error holds the message on failure
-    Failed entries capture terminal executor failures and guard errors
+    Failed entries capture launched firings that ended in terminal failure
 """
 struct TransitionResult{T<:AbstractToken}
     transition_id::Symbol
@@ -75,9 +85,11 @@ end
 """
     Final result for one run_key after the engine finishes
     status is :completed, :failed, or :incomplete
-    terminal_reason explains why: :executor_failed, :fuse_exhausted, :no_enabled_transition
+    terminal_reason explains why: :executor_failed, :guard_error, :fuse_exhausted, :no_enabled_transition
     trace holds the recorded outcomes for this run_key in engine order
-    retrying failures are emitted as events but are not retained in trace
+    trace contains terminal outcomes for launched firings only
+    retry attempts that will relaunch are emitted as events only
+    terminal failures, including retries blocked by fuse exhaustion, are retained in trace
     final_marking keeps only this run_key's tokens when fire() stopped
 """
 struct RunResult{T<:AbstractToken}

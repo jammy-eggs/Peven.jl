@@ -294,6 +294,187 @@ end
         @test isempty(hot(net, marking; check=Symbol[]))
     end
 
+    # ── _collect_enablement ──────────────────────────────────────────────────
+
+    @testset "_collect_enablement: classifies ready blocked and errored pairs" begin
+        places = Dict(:ready => Place(:ready), :done => Place(:done))
+        transitions = Dict(
+            :ready_t => Transition(:ready_t),
+            :blocked_t => Transition(:blocked_t; guard=_ -> false),
+            :errored_t => Transition(:errored_t; guard=_ -> error("boom")),
+        )
+        arcsfrom = [ArcFrom(:ready_t, :ready), ArcFrom(:blocked_t, :ready), ArcFrom(:errored_t, :ready)]
+        arcsto = [ArcTo(:ready_t, :done), ArcTo(:blocked_t, :done), ArcTo(:errored_t, :done)]
+        net = Net(places, transitions, arcsfrom, arcsto)
+        marking = Marking(Dict(:ready => Token[Token(:red, "r1", 1)]))
+
+        errors = Any[]
+        entries = Peven._collect_enablement(
+            net,
+            marking;
+            on_guard_error=(tid, rk, e) -> push!(errors, (tid, rk, e)),
+        )
+
+        @test entries[(:ready_t, "r1")].status === :ready
+        @test entries[(:blocked_t, "r1")].status === :guard_blocked
+        @test entries[(:errored_t, "r1")].status === :guard_errored
+        @test entries[(:errored_t, "r1")].error == "boom"
+        @test length(errors) == 1
+        @test errors[1][1] === :errored_t
+        @test errors[1][2] == "r1"
+    end
+
+    @testset "_collect_enablement: does not mutate marking" begin
+        net = chain_net()
+        marking = Marking(Dict(:ready => Token[Token(:red, "r1", "work")]))
+        original = [token.payload for token in marking.tokens_by_place[:ready]]
+
+        entries = Peven._collect_enablement(net, marking)
+
+        @test [token.payload for token in marking.tokens_by_place[:ready]] == original
+        @test entries[(:judge, "r1")].status === :ready
+    end
+
+    @testset "_collect_enablement: hot and cold remain projections" begin
+        places = Dict(:ready => Place(:ready), :done => Place(:done))
+        transitions = Dict(
+            :pass_t => Transition(:pass_t),
+            :guarded_t => Transition(:guarded_t; guard=_ -> false),
+            :other_t => Transition(:other_t),
+        )
+        arcsfrom = [ArcFrom(:pass_t, :ready), ArcFrom(:guarded_t, :ready), ArcFrom(:other_t, :done)]
+        arcsto = [ArcTo(:pass_t, :done), ArcTo(:guarded_t, :done), ArcTo(:other_t, :ready)]
+        net = Net(places, transitions, arcsfrom, arcsto)
+        marking = Marking(Dict(:ready => Token[Token("r1")]))
+
+        entries = Peven._collect_enablement(net, marking)
+        ready_pairs = sort!(Tuple{Symbol, String}[pair for (pair, entry) in entries if entry.status === :ready])
+        cold_tids = sort!(Symbol[
+            tid for tid in sort!(collect(keys(net.transitions))) if all(
+                !(pair[1] === tid && entry.status === :ready) for (pair, entry) in entries
+            )
+        ])
+
+        @test hot(net, marking) == ready_pairs
+        @test cold(net, marking) == cold_tids
+    end
+
+    # ── _reconcile_enablement! ───────────────────────────────────────────────
+
+    @testset "_reconcile_enablement!: guard error is edge-triggered across rescans" begin
+        mode = Ref(:errored)
+        net = chain_net(guard=_ -> begin
+            mode[] === :errored && error("boom")
+            mode[] === :blocked && return false
+            return true
+        end)
+        marking = Marking(Dict(:ready => Token[Token("r1")]))
+        state = Peven._scheduler_state(marking)
+        events = EngineEvent[]
+        hook = event -> push!(events, event)
+
+        Peven._reconcile_enablement!(
+            state,
+            Peven._collect_enablement(net, marking),
+            [:judge];
+            on_event=hook,
+        )
+        @test [event for event in events if event isa Peven.GuardErrored] |> length == 1
+        @test haskey(state.runs["r1"].active_guard_errors, :judge)
+        @test isempty(state.ready)
+
+        Peven._reconcile_enablement!(
+            state,
+            Peven._collect_enablement(net, marking),
+            [:judge];
+            on_event=hook,
+        )
+        @test [event for event in events if event isa Peven.GuardErrored] |> length == 1
+        @test haskey(state.runs["r1"].active_guard_errors, :judge)
+
+        mode[] = :ready
+        Peven._reconcile_enablement!(
+            state,
+            Peven._collect_enablement(net, marking),
+            [:judge];
+            on_event=hook,
+        )
+        @test !haskey(state.runs["r1"].active_guard_errors, :judge)
+        @test state.ready == [(:judge, "r1")]
+
+        mode[] = :blocked
+        Peven._reconcile_enablement!(
+            state,
+            Peven._collect_enablement(net, marking),
+            [:judge];
+            on_event=hook,
+        )
+        @test !haskey(state.runs["r1"].active_guard_errors, :judge)
+        @test isempty(state.ready)
+
+        mode[] = :errored
+        Peven._reconcile_enablement!(
+            state,
+            Peven._collect_enablement(net, marking),
+            [:judge];
+            on_event=hook,
+        )
+        guard_events = [event for event in events if event isa Peven.GuardErrored]
+        @test length(guard_events) == 2
+        @test haskey(state.runs["r1"].active_guard_errors, :judge)
+    end
+
+    # ── _finalize_results ────────────────────────────────────────────────────
+
+    @testset "_finalize_results: active guard error fails the run" begin
+        net = chain_net()
+        marking = Marking(Dict(:ready => Token[Token("r1")]))
+        state = Peven._scheduler_state(marking)
+        state.runs["r1"].active_guard_errors[:judge] = Peven._GuardErrorEpisode("boom", 1)
+
+        results = Peven._finalize_results(net, state, ["r1"]; fuse=10)
+
+        @test length(results) == 1
+        @test results[1].status === :failed
+        @test results[1].terminal_reason === :guard_error
+        @test results[1].error == "boom"
+        @test isempty(results[1].trace)
+    end
+
+    @testset "_finalize_results: terminal reasons stay per-run" begin
+        net = chain_net()
+        marking = Marking(Dict(:ready => Token[
+            Token("r1"),
+            Token("r2"),
+            Token("r3"),
+            Token("r4"),
+        ]))
+        state = Peven._scheduler_state(marking)
+        state.fired = 3
+        state.runs["r1"].active_guard_errors[:judge] = Peven._GuardErrorEpisode("guard boom", 1)
+        state.runs["r2"].fuse_blocked = true
+        state.runs["r3"].executor_failed = true
+        state.runs["r3"].executor_error = "executor boom"
+
+        results = Dict(result.run_key => result for result in Peven._finalize_results(net, state, ["r1", "r2", "r3", "r4"]; fuse=3))
+
+        @test results["r1"].status === :failed
+        @test results["r1"].terminal_reason === :guard_error
+        @test results["r1"].error == "guard boom"
+
+        @test results["r2"].status === :incomplete
+        @test results["r2"].terminal_reason === :fuse_exhausted
+        @test isnothing(results["r2"].error)
+
+        @test results["r3"].status === :failed
+        @test results["r3"].terminal_reason === :executor_failed
+        @test results["r3"].error == "executor boom"
+
+        @test results["r4"].status === :incomplete
+        @test results["r4"].terminal_reason === :no_enabled_transition
+        @test isnothing(results["r4"].error)
+    end
+
     # ── cold ──────────────────────────────────────────────────────────────
 
     @testset "cold: all enabled" begin
@@ -470,6 +651,48 @@ end
         end
     end
 
+    @testset "fire: guard exceptions emit GuardErrored without fake firings" begin
+        net = chain_net(guard = _ -> error("boom"))
+        marking = Marking(Dict(:ready => Token[Token("r1")]))
+        events = EngineEvent[]
+        with_executor(:default, FunctionExecutor(passthrough)) do
+            results = fire(net, marking; max_concurrency=1, on_event = event -> push!(events, event))
+            @test length(results) == 1
+            @test results[1].status === :failed
+            @test results[1].terminal_reason === :guard_error
+            @test results[1].error == "boom"
+            @test isempty(results[1].trace)
+            @test length([event for event in events if event isa GuardErrored]) == 1
+            @test isempty([event for event in events if event isa TransitionStarted])
+            @test isempty([event for event in events if event isa TransitionFailed])
+        end
+    end
+
+    @testset "fire: guard exceptions do not create firing-id gaps" begin
+        net = chain_net(guard = ts -> begin
+            Peven.run_key(ts[1]) == "r1" && error("boom")
+            true
+        end)
+        marking = Marking(Dict(:ready => Token[Token("r1"), Token("r2")]))
+        events = EngineEvent[]
+        with_executor(:default, FunctionExecutor(passthrough)) do
+            results = fire(net, marking; max_concurrency=1, on_event = event -> push!(events, event))
+            started = [event for event in events if event isa TransitionStarted]
+            completed = [event for event in events if event isa TransitionCompleted]
+            guard_events = [event for event in events if event isa GuardErrored]
+            r1 = only([result for result in results if result.run_key == "r1"])
+            r2 = only([result for result in results if result.run_key == "r2"])
+
+            @test length(guard_events) == 1
+            @test length(started) == 1
+            @test started[1].firing_id == 1
+            @test length(completed) == 1
+            @test completed[1].firing_id == 1
+            @test isempty(r1.trace)
+            @test r2.trace[1].firing_id == 1
+        end
+    end
+
     @testset "fire: retry recovers" begin
         attempts = Ref(0)
         net = chain_net(retries=1)
@@ -488,6 +711,34 @@ end
         end
     end
 
+    @testset "fire: retry does not re-evaluate the guard" begin
+        guard_calls = Ref(0)
+        guard_open = Ref(true)
+        net = chain_net(
+            guard=_ -> begin
+                guard_calls[] += 1
+                guard_open[]
+            end,
+            retries=1,
+        )
+        marking = Marking(Dict(:ready => Token[Token("r1")]))
+        attempts = Ref(0)
+        executor = FunctionExecutor((tid, tokens) -> begin
+            attempts[] += 1
+            if attempts[] == 1
+                guard_open[] = false
+                error("transient")
+            end
+            passthrough(tid, tokens)
+        end)
+        with_executor(:default, executor) do
+            results = fire(net, marking; max_concurrency=1)
+            @test results[1].status === :completed
+            @test guard_calls[] == 1
+            @test results[1].trace[1].attempts == 2
+        end
+    end
+
     @testset "fire: retry exhausted" begin
         net = chain_net(retries=0)
         marking = Marking(Dict(:ready => Token[Token("r1")]))
@@ -501,18 +752,100 @@ end
         end
     end
 
+    @testset "fire: executor failure suppresses sibling ready work for the run" begin
+        net = split_net()
+        marking = Marking(Dict(
+            :left => Token[Token("r1")],
+            :right => Token[Token("r1")],
+        ))
+        events = EngineEvent[]
+        executor = FunctionExecutor((tid, tokens) -> begin
+            tid === :left_t && error("permanent")
+            passthrough(tid, tokens)
+        end)
+        with_executor(:default, executor) do
+            results = fire(net, marking; max_concurrency=1, on_event = event -> push!(events, event))
+            @test length(results) == 1
+            @test results[1].status === :failed
+            @test results[1].terminal_reason === :executor_failed
+            @test [step.transition_id for step in results[1].trace] == [:left_t]
+            @test [event.transition_id for event in events if event isa TransitionStarted] == [:left_t]
+            @test get(results[1].final_marking.tokens_by_place, :right, Token[])[1] |> Peven.run_key == "r1"
+        end
+    end
+
+    @testset "fire: executor failure suppresses later guard errors for the run" begin
+        guard_mode = Ref(:open)
+        net = chain_net(
+            guard=_ -> begin
+                guard_mode[] === :errored && error("guard boom")
+                true
+            end,
+            retries=0,
+        )
+        marking = Marking(Dict(:ready => Token[Token("r1"), Token("r1")]))
+        events = EngineEvent[]
+        executor = FunctionExecutor((_, _) -> begin
+            guard_mode[] = :errored
+            error("permanent")
+        end)
+        with_executor(:default, executor) do
+            results = fire(net, marking; max_concurrency=1, on_event = event -> push!(events, event))
+            @test results[1].status === :failed
+            @test results[1].terminal_reason === :executor_failed
+            @test isempty([event for event in events if event isa GuardErrored])
+        end
+    end
+
     @testset "fire: retry blocked by fuse restores marking" begin
         net = chain_net(retries=1)
         marking = Marking(Dict(:ready => Token[Token(:default, "r1", "work")]))
         executor = FunctionExecutor((_, _) -> error("transient"))
         with_executor(:default, executor) do
-            results = fire(net, marking; max_concurrency=1, fuse=1)
+            events = EngineEvent[]
+            results = fire(net, marking; max_concurrency=1, fuse=1, on_event = event -> push!(events, event))
             @test length(results) == 1
             @test results[1].status === :incomplete
             @test results[1].terminal_reason === :fuse_exhausted
-            @test isempty(results[1].trace)
+            @test length(results[1].trace) == 1
+            @test results[1].trace[1].status === :failed
+            @test results[1].trace[1].firing_id == 1
+            @test results[1].trace[1].attempts == 1
             @test get(results[1].final_marking.tokens_by_place, :ready, Token[])[1].payload == "work"
             @test !haskey(results[1].final_marking.tokens_by_place, :done)
+            failed = only([event for event in events if event isa TransitionFailed])
+            @test failed.firing_id == 1
+            @test failed.retrying == false
+        end
+    end
+
+    @testset "fire: fuse-blocked retry can coexist with a successful sibling firing" begin
+        net = chain_net(retries=1)
+        marking = Marking(Dict(:ready => Token[
+            Token(:default, "r1", "retry"),
+            Token(:default, "r1", "done"),
+        ]))
+        attempts_by_payload = Dict{Any, Int}()
+        events = EngineEvent[]
+        executor = FunctionExecutor((tid, tokens) -> begin
+            payload = only(tokens).payload
+            attempt = get(attempts_by_payload, payload, 0) + 1
+            attempts_by_payload[payload] = attempt
+            if payload == "retry" && attempt == 1
+                error("transient")
+            end
+            passthrough(tid, tokens)
+        end)
+        with_executor(:default, executor) do
+            results = fire(net, marking; max_concurrency=2, fuse=2, on_event = event -> push!(events, event))
+            @test length(results) == 1
+            @test results[1].status === :incomplete
+            @test results[1].terminal_reason === :fuse_exhausted
+            @test Set(step.status for step in results[1].trace) == Set([:completed, :failed])
+            @test length([event for event in events if event isa TransitionCompleted]) == 1
+            @test length([event for event in events if event isa TransitionFailed && !event.retrying]) == 1
+            @test [token.payload for token in get(results[1].final_marking.tokens_by_place, :done, Token[])] == [(transition=:judge,)]
+            @test [token.payload for token in get(results[1].final_marking.tokens_by_place, :ready, Token[])] == ["retry"]
         end
     end
 
@@ -716,6 +1049,44 @@ end
             observed = sort([sort(attempts) for attempts in values(attempts_by_firing)], by=length)
             @test observed == [[1], [1, 2]]
             @test results[1].status === :completed
+        end
+    end
+
+    @testset "fire: guard error recovery and re-entry emit edge events" begin
+        places = Dict(:ready => Place(:ready), :pulse => Place(:pulse))
+        mode = Ref(:errored)
+        transitions = Dict(
+            :a_judge => Transition(:a_judge; guard=_ -> begin
+                mode[] === :errored && error("boom")
+                mode[] === :blocked && return false
+                true
+            end),
+            :z_flip => Transition(:z_flip),
+        )
+        arcsfrom = [ArcFrom(:a_judge, :ready), ArcFrom(:a_judge, :pulse), ArcFrom(:z_flip, :pulse)]
+        arcsto = [ArcTo(:a_judge, :ready), ArcTo(:a_judge, :pulse), ArcTo(:z_flip, :pulse)]
+        net = Net(places, transitions, arcsfrom, arcsto)
+        marking = Marking(Dict(:ready => Token[Token("r1")], :pulse => Token[Token("r1")]))
+        flips = Ref(0)
+        events = EngineEvent[]
+        executor = FunctionExecutor((tid, tokens) -> begin
+            if tid === :z_flip
+                flips[] += 1
+                mode[] = flips[] == 1 ? :ready : :errored
+            elseif tid === :a_judge
+                mode[] = :blocked
+            end
+            passthrough(tid, tokens)
+        end)
+        with_executor(:default, executor) do
+            results = fire(net, marking; max_concurrency=1, fuse=3, on_event = event -> push!(events, event))
+            guard_events = [event for event in events if event isa GuardErrored]
+
+            @test length(guard_events) == 2
+            @test all(event.transition_id === :a_judge for event in guard_events)
+            @test results[1].status === :failed
+            @test results[1].terminal_reason === :guard_error
+            @test results[1].error == "boom"
         end
     end
 

@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.3.0
+
+- Add `GuardErrored` for scheduler-time guard exceptions
+- Stop allocating firing ids or synthetic `TransitionFailed` / trace rows for guard exceptions
+- Make `TransitionResult.trace` represent launched firings only
+- Finalize unresolved guard exceptions as `RunResult(status=:failed, terminal_reason=:guard_error)`
+- Close fuse-blocked retries with a real failed firing record, `TransitionFailed(retrying=false)`, and restored inputs
+
 ## v0.2.0
 
 - Allow overlapping firings of the same `(transition, run_key)` when enough input tokens exist
