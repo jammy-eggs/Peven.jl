@@ -6,31 +6,37 @@ abstract type EngineEvent end
 
 """
     Emitted when a transition begins executing
-    inputs contains the tokens that were grabbed from input places
+    inputs contains the tokens reserved for this firing
 """
-struct TransitionStarted <: EngineEvent
+struct TransitionStarted{T<:AbstractToken} <: EngineEvent
     transition_id::Symbol
     run_key::String
-    inputs::Vector{<:AbstractToken}
+    firing_id::Int
+    attempt::Int
+    inputs::Vector{T}
 end
 
 """
     Emitted when a transition completes successfully
-    output is the token that will be dropped into output places
+    outputs contains the executor's pre-fan-out outputs
 """
-struct TransitionCompleted <: EngineEvent
+struct TransitionCompleted{T<:AbstractToken} <: EngineEvent
     transition_id::Symbol
     run_key::String
-    output::AbstractToken
+    firing_id::Int
+    attempt::Int
+    outputs::Vector{T}
 end
 
 """
     Emitted when a transition fails
-    retrying is true if the transition will be re-attempted, false if retries are exhausted
+    retrying is true if the firing will be re-attempted, false if retries are exhausted
 """
 struct TransitionFailed <: EngineEvent
     transition_id::Symbol
     run_key::String
+    firing_id::Int
+    attempt::Int
     error::String
     retrying::Bool
 end
@@ -41,24 +47,28 @@ end
 """
     Record of a terminal transition outcome kept in a run trace
     status is :completed or :failed
-    output holds the produced token on success, error holds the message on failure
+    outputs holds the executor's pre-fan-out outputs on success, error holds the message on failure
     Failed entries capture terminal executor failures and guard errors
 """
-struct TransitionResult
+struct TransitionResult{T<:AbstractToken}
     transition_id::Symbol
     run_key::String
+    firing_id::Int
     status::Symbol
-    output::Union{Nothing, AbstractToken}
+    outputs::Vector{T}
     error::Union{Nothing, String}
+    attempts::Int
 
     function TransitionResult(
         transition_id::Symbol,
         run_key::String,
+        firing_id::Int,
         status::Symbol,
-        output::Union{Nothing, AbstractToken},
+        outputs::Vector{T},
         error::Union{Nothing, String},
-    )
-        new(transition_id, run_key, status, output, error)
+        attempts::Int,
+    ) where {T<:AbstractToken}
+        new{T}(transition_id, run_key, firing_id, status, outputs, error, attempts)
     end
 end
 
@@ -70,29 +80,29 @@ end
     retrying failures are emitted as events but are not retained in trace
     final_marking keeps only this run_key's tokens when fire() stopped
 """
-struct RunResult
+struct RunResult{T<:AbstractToken}
     run_key::String
     status::Symbol
     error::Union{Nothing, String}
     terminal_reason::Union{Nothing, Symbol}
-    trace::Vector{TransitionResult}
-    final_marking::Marking
+    trace::Vector{TransitionResult{T}}
+    final_marking::Marking{T}
 
     function RunResult(
         run_key::String,
         status::Symbol,
         error::Union{Nothing, String},
         terminal_reason::Union{Nothing, Symbol},
-        trace::Vector{TransitionResult},
-        final_marking::Marking,
-    )
-        new(run_key, status, error, terminal_reason, trace, final_marking)
+        trace::Vector{TransitionResult{T}},
+        final_marking::Marking{T},
+    ) where {T<:AbstractToken}
+        new{T}(run_key, status, error, terminal_reason, trace, final_marking)
     end
 end
 
 """
     Emitted once per run_key when the engine finishes processing it
 """
-struct RunFinished <: EngineEvent
-    result::RunResult
+struct RunFinished{T<:AbstractToken} <: EngineEvent
+    result::RunResult{T}
 end

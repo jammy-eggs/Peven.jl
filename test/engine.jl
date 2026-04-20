@@ -23,6 +23,15 @@ function join_net()
     return Net(places, transitions, arcsfrom, arcsto)
 end
 
+# Branch: ready --> judge --> left, right
+function branch_net()
+    places = Dict(:ready => Place(:ready), :left => Place(:left), :right => Place(:right))
+    transitions = Dict(:judge => Transition(:judge))
+    arcsfrom = [ArcFrom(:judge, :ready)]
+    arcsto = [ArcTo(:judge, :left), ArcTo(:judge, :right)]
+    return Net(places, transitions, arcsfrom, arcsto)
+end
+
 # Weighted: ready --(2)--> judge --(1)--> done
 function weighted_net()
     places = Dict(:ready => Place(:ready), :done => Place(:done))
@@ -38,6 +47,15 @@ function bounded_net()
     transitions = Dict(:judge => Transition(:judge))
     arcsfrom = [ArcFrom(:judge, :ready)]
     arcsto = [ArcTo(:judge, :done)]
+    return Net(places, transitions, arcsfrom, arcsto)
+end
+
+# Weighted output: ready --> judge --(2)--> done
+function weighted_output_net()
+    places = Dict(:ready => Place(:ready), :done => Place(:done))
+    transitions = Dict(:judge => Transition(:judge))
+    arcsfrom = [ArcFrom(:judge, :ready)]
+    arcsto = [ArcTo(:judge, :done, 2)]
     return Net(places, transitions, arcsfrom, arcsto)
 end
 
@@ -91,6 +109,44 @@ end
         marking = Marking(Dict(:done => Token[Token(:red, "r1", "existing")]))
         output = Token(:red, "r1", "overflow")
         @test_throws ArgumentError drop(marking, net, :judge, output)
+    end
+
+    @testset "drop: many outputs" begin
+        net = chain_net()
+        marking = Marking()
+        outputs = Token[Token(:red, "r1", "a"), Token(:red, "r1", "b")]
+        new_marking = drop(marking, net, :judge, outputs)
+        @test [token.payload for token in new_marking.tokens_by_place[:done]] == ["a", "b"]
+    end
+
+    @testset "drop: many outputs is atomic on capacity failure" begin
+        net = bounded_net()
+        marking = Marking(Dict(:done => Token[Token(:red, "r1", "existing")]))
+        outputs = Token[Token(:red, "r1", "a"), Token(:red, "r1", "b")]
+        @test_throws ArgumentError drop(marking, net, :judge, outputs)
+        @test [token.payload for token in marking.tokens_by_place[:done]] == ["existing"]
+    end
+
+    @testset "drop: many outputs rejects branching fan-out" begin
+        net = branch_net()
+        marking = Marking()
+        outputs = Token[Token(:red, "r1", "a"), Token(:red, "r1", "b")]
+        @test_throws ArgumentError drop(marking, net, :judge, outputs)
+    end
+
+    @testset "drop: many outputs rejects weighted output arc" begin
+        net = weighted_output_net()
+        marking = Marking()
+        outputs = Token[Token(:red, "r1", "a"), Token(:red, "r1", "b")]
+        @test_throws ArgumentError drop(marking, net, :judge, outputs)
+    end
+
+    @testset "drop: many outputs accepts concrete vectors for Marking{AbstractToken}" begin
+        net = chain_net()
+        marking = Marking{AbstractToken}(Dict(:done => AbstractToken[]))
+        outputs = Token[Token(:red, "r1", "a"), Token(:red, "r1", "b")]
+        new_marking = drop(marking, net, :judge, outputs)
+        @test [token.payload for token in new_marking.tokens_by_place[:done]] == ["a", "b"]
     end
 
     # ── misfire ─────────────────────────────────────────────────────────────
@@ -148,15 +204,17 @@ end
 
     @testset "emit" begin
         # emit with nothing hook does nothing
-        emit(nothing, TransitionStarted(:t, "r1", Token[]))
+        emit(nothing, TransitionStarted(:t, "r1", 1, 1, Token[]))
 
         # emit with hook calls it
         events = EngineEvent[]
         hook = e -> push!(events, e)
-        emit(hook, TransitionStarted(:t, "r1", Token[]))
+        emit(hook, TransitionStarted(:t, "r1", 1, 1, Token[]))
         @test length(events) == 1
         @test events[1] isa TransitionStarted
         @test events[1].transition_id === :t
+        @test events[1].firing_id == 1
+        @test events[1].attempt == 1
     end
 
     # ── hot ───────────────────────────────────────────────────────────────
@@ -377,6 +435,8 @@ end
             @test results[1].run_key == "r1"
             @test length(results[1].trace) == 1
             @test results[1].trace[1].status === :completed
+            @test length(results[1].trace[1].outputs) == 1
+            @test results[1].trace[1].attempts == 1
         end
     end
 
@@ -424,6 +484,7 @@ end
             @test length(results) == 1
             @test results[1].status === :completed
             @test attempts[] == 2
+            @test results[1].trace[1].attempts == 2
         end
     end
 
@@ -437,6 +498,40 @@ end
             @test results[1].status === :failed
             @test results[1].terminal_reason === :executor_failed
             @test results[1].error !== nothing
+        end
+    end
+
+    @testset "fire: retry blocked by fuse restores marking" begin
+        net = chain_net(retries=1)
+        marking = Marking(Dict(:ready => Token[Token(:default, "r1", "work")]))
+        executor = FunctionExecutor((_, _) -> error("transient"))
+        with_executor(:default, executor) do
+            results = fire(net, marking; max_concurrency=1, fuse=1)
+            @test length(results) == 1
+            @test results[1].status === :incomplete
+            @test results[1].terminal_reason === :fuse_exhausted
+            @test isempty(results[1].trace)
+            @test get(results[1].final_marking.tokens_by_place, :ready, Token[])[1].payload == "work"
+            @test !haskey(results[1].final_marking.tokens_by_place, :done)
+        end
+    end
+
+    @testset "fire: retry gets a fresh input vector" begin
+        attempts = Ref(0)
+        net = chain_net(retries=1)
+        marking = Marking(Dict(:ready => Token[Token(:default, "r1", "work")]))
+        executor = FunctionExecutor((tid, tokens) -> begin
+            attempts[] += 1
+            if attempts[] == 1
+                empty!(tokens)
+                error("transient")
+            end
+            return Token(color(tokens[1]), Peven.run_key(tokens[1]), length(tokens))
+        end)
+        with_executor(:default, executor) do
+            results = fire(net, marking; max_concurrency=1)
+            @test results[1].status === :completed
+            @test results[1].trace[1].outputs[1].payload == 1
         end
     end
 
@@ -466,6 +561,183 @@ end
         @test any(e -> e isa TransitionStarted, events)
         @test any(e -> e isa TransitionCompleted, events)
         @test any(e -> e isa RunFinished, events)
+        started = only([e for e in events if e isa TransitionStarted])
+        completed = only([e for e in events if e isa TransitionCompleted])
+        finished = only([e for e in events if e isa RunFinished])
+        @test started.firing_id == 1
+        @test started.attempt == 1
+        @test completed.firing_id == 1
+        @test completed.attempt == 1
+        @test length(completed.outputs) == 1
+        @test finished.result.trace[1].firing_id == 1
+        @test length(finished.result.trace[1].outputs) == 1
+    end
+
+    @testset "fire: vector output emits many tokens to one place" begin
+        net = chain_net()
+        marking = Marking(Dict(:ready => Token[Token("r1")]))
+        executor = FunctionExecutor((_, tokens) -> Token[
+            Token(color(tokens[1]), Peven.run_key(tokens[1]), "a"),
+            Token(color(tokens[1]), Peven.run_key(tokens[1]), "b"),
+        ])
+        with_executor(:default, executor) do
+            results = fire(net, marking; max_concurrency=1)
+            @test results[1].status === :completed
+            @test [token.payload for token in results[1].trace[1].outputs] == ["a", "b"]
+            @test [token.payload for token in results[1].final_marking.tokens_by_place[:done]] == ["a", "b"]
+        end
+    end
+
+    @testset "fire: plain return keeps fan-out semantics" begin
+        net = branch_net()
+        marking = Marking(Dict(:ready => Token[Token("r1")]))
+        with_executor(:default, FunctionExecutor(passthrough)) do
+            results = fire(net, marking; max_concurrency=1)
+            outputs = results[1].trace[1].outputs
+            @test length(outputs) == 1
+            @test get(results[1].final_marking.tokens_by_place, :left, Token[])[1].payload == (transition=:judge,)
+            @test get(results[1].final_marking.tokens_by_place, :right, Token[])[1].payload == (transition=:judge,)
+        end
+    end
+
+    @testset "fire: vector output rejects branching transitions" begin
+        net = branch_net()
+        marking = Marking(Dict(:ready => Token[Token("r1")]))
+        executor = FunctionExecutor((_, tokens) -> Token[
+            Token(color(tokens[1]), Peven.run_key(tokens[1]), "a"),
+            Token(color(tokens[1]), Peven.run_key(tokens[1]), "b"),
+        ])
+        with_executor(:default, executor) do
+            @test_throws ArgumentError fire(net, marking; max_concurrency=1)
+        end
+    end
+
+    @testset "fire: singleton vector output rejects branching transitions" begin
+        net = branch_net()
+        marking = Marking(Dict(:ready => Token[Token("r1")]))
+        executor = FunctionExecutor((_, tokens) -> Token[
+            Token(color(tokens[1]), Peven.run_key(tokens[1]), "a"),
+        ])
+        with_executor(:default, executor) do
+            @test_throws ArgumentError fire(net, marking; max_concurrency=1)
+        end
+    end
+
+    @testset "fire: vector output rejects weighted output arcs" begin
+        net = weighted_output_net()
+        marking = Marking(Dict(:ready => Token[Token("r1")]))
+        executor = FunctionExecutor((_, tokens) -> Token[
+            Token(color(tokens[1]), Peven.run_key(tokens[1]), "a"),
+            Token(color(tokens[1]), Peven.run_key(tokens[1]), "b"),
+        ])
+        with_executor(:default, executor) do
+            @test_throws ArgumentError fire(net, marking; max_concurrency=1)
+        end
+    end
+
+    @testset "fire: singleton vector output rejects weighted output arcs" begin
+        net = weighted_output_net()
+        marking = Marking(Dict(:ready => Token[Token("r1")]))
+        executor = FunctionExecutor((_, tokens) -> Token[
+            Token(color(tokens[1]), Peven.run_key(tokens[1]), "a"),
+        ])
+        with_executor(:default, executor) do
+            @test_throws ArgumentError fire(net, marking; max_concurrency=1)
+        end
+    end
+
+    @testset "fire: vector output works with Marking{AbstractToken}" begin
+        net = chain_net()
+        marking = Marking{AbstractToken}(Dict(:ready => AbstractToken[Token("r1")]))
+        executor = FunctionExecutor((_, tokens) -> Token[
+            Token(color(tokens[1]), Peven.run_key(tokens[1]), "a"),
+            Token(color(tokens[1]), Peven.run_key(tokens[1]), "b"),
+        ])
+        with_executor(:default, executor) do
+            results = fire(net, marking; max_concurrency=1)
+            @test results[1].status === :completed
+            @test [token.payload for token in results[1].trace[1].outputs] == ["a", "b"]
+            @test [token.payload for token in results[1].final_marking.tokens_by_place[:done]] == ["a", "b"]
+        end
+    end
+
+    @testset "fire: overlaps same transition and run_key" begin
+        net = chain_net()
+        marking = Marking(Dict(:ready => Token[Token("r1"), Token("r1")]))
+        events = EngineEvent[]
+        executor = FunctionExecutor((tid, tokens) -> begin
+            sleep(0.1)
+            passthrough(tid, tokens)
+        end)
+        with_executor(:default, executor) do
+            results = fire(net, marking; max_concurrency=2, on_event=event -> push!(events, event))
+            @test length(results) == 1
+            @test length(results[1].trace) == 2
+            @test length(Set(step.firing_id for step in results[1].trace)) == 2
+            started = findall(event -> event isa TransitionStarted, events)
+            completed = findall(event -> event isa TransitionCompleted, events)
+            @test length(started) == 2
+            @test length(completed) == 2
+            @test started[2] < completed[1]
+        end
+    end
+
+    @testset "fire: retries keep firing identity" begin
+        net = chain_net(retries=1)
+        marking = Marking(Dict(:ready => Token[
+            Token(:default, "r1", "a"),
+            Token(:default, "r1", "b"),
+        ]))
+        events = EngineEvent[]
+        state_lock = ReentrantLock()
+        attempts_by_payload = Dict{Any, Int}()
+        executor = FunctionExecutor((_, tokens) -> begin
+            payload = only(tokens).payload
+            attempt = Base.lock(state_lock) do
+                next = get(attempts_by_payload, payload, 0) + 1
+                attempts_by_payload[payload] = next
+                next
+            end
+            if payload == "a" && attempt == 1
+                sleep(0.05)
+                error("transient")
+            end
+            sleep(0.1)
+            return Token(color(tokens[1]), Peven.run_key(tokens[1]), payload)
+        end)
+        with_executor(:default, executor) do
+            results = fire(net, marking; max_concurrency=2, on_event = e -> push!(events, e))
+            started_events = [event for event in events if event isa TransitionStarted]
+            @test length(Set(event.firing_id for event in started_events)) == 2
+            attempts_by_firing = Dict{Int, Vector{Int}}()
+            for event in started_events
+                push!(get!(attempts_by_firing, event.firing_id, Int[]), event.attempt)
+            end
+            observed = sort([sort(attempts) for attempts in values(attempts_by_firing)], by=length)
+            @test observed == [[1], [1, 2]]
+            @test results[1].status === :completed
+        end
+    end
+
+    @testset "fire: fuse exhaustion drains started firings" begin
+        places = Dict(:ready => Place(:ready))
+        transitions = Dict(:judge => Transition(:judge))
+        arcsfrom = [ArcFrom(:judge, :ready)]
+        arcsto = [ArcTo(:judge, :ready)]
+        net = Net(places, transitions, arcsfrom, arcsto)
+        marking = Marking(Dict(:ready => Token[Token("r1"), Token("r1")]))
+        events = EngineEvent[]
+        executor = FunctionExecutor((tid, tokens) -> begin
+            sleep(0.1)
+            passthrough(tid, tokens)
+        end)
+        with_executor(:default, executor) do
+            results = fire(net, marking; max_concurrency=2, fuse=2, on_event = e -> push!(events, e))
+            started_events = [event for event in events if event isa TransitionStarted]
+            @test length(started_events) == 2
+            @test results[1].status === :incomplete
+            @test results[1].terminal_reason === :fuse_exhausted
+        end
     end
 
     @testset "fire: invalid net" begin
