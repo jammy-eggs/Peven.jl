@@ -87,9 +87,14 @@ Executors may return one token or a vector of tokens. Vector outputs are valid o
 
 ## Events and traces
 
-`TransitionStarted`, `TransitionCompleted`, and `TransitionFailed` are emitted through `on_event`.
+`TransitionStarted`, `TransitionCompleted`, and `TransitionFailed` are emitted through `on_event` for launched firings only.
+Guard exceptions now emit `GuardErrored` instead of being reported as synthetic transition failures.
 Completed events and `TransitionResult`s now carry `outputs::Vector{T}` so scalar and vector executor returns share one shape.
 Each firing also has a stable `firing_id`, and retries increment `attempt` while keeping the same `firing_id`.
+`TransitionResult.trace` now contains launched firings only; guard exceptions do not allocate firing ids or create trace rows.
+
+`hot` and `cold` remain stateless snapshot helpers. Their optional `on_guard_error` callback is per-call and non-deduplicated.
+`fire` owns guard-error lifecycle state and emits `GuardErrored` only when a `(transition, run_key)` pair enters an active guard-error state.
 
 ## Validation
 
@@ -104,8 +109,10 @@ issues = validate(net, marking)
 ## Run outcomes
 
 - `completed` -- all tokens reached terminal places
-- `failed` -- an executor failed after retries were exhausted
+- `failed` -- an executor failed after retries were exhausted, or an active guard exception remained at shutdown
 - `incomplete` -- tokens remain in nonterminal places because no transition is enabled or the fuse budget was exhausted
+
+`RunResult.terminal_reason` is one of `:executor_failed`, `:guard_error`, `:fuse_exhausted`, or `:no_enabled_transition`.
 
 ## Tests
 

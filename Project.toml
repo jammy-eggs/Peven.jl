@@ -1,6 +1,6 @@
 name = "Peven"
 uuid = "7c3f1014-b4da-4ae0-8bf8-3335ad02c49c"
-version = "0.2.0"
+version = "0.3.0"
 
 [compat]
 Aqua = "0.8"
