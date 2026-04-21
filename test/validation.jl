@@ -3,10 +3,10 @@ module SrcValidationTests
 using Test
 using Main.Peven
 
-function toy_net(; extra_transitions=Dict{Symbol, Transition}())
+function toy_net(; extra_transitions=Dict{Symbol,Transition}())
     places = Dict(
         :ready => Place(:ready, 2),
-        :done  => Place(:done),
+        :done => Place(:done),
     )
     transitions = Dict(:judge => Transition(:judge))
     merge!(transitions, extra_transitions)
@@ -75,7 +75,6 @@ end
 
         issues = validate(net)
         @test any(i -> i.code === :orphan_place && i.object_id === :lonely, issues)
-        # :ready and :done have arcs, so they should not be flagged
         @test !any(i -> i.code === :orphan_place && i.object_id === :ready, issues)
         @test !any(i -> i.code === :orphan_place && i.object_id === :done, issues)
     end
@@ -88,6 +87,57 @@ end
 
         issues = validate(net, marking)
         @test any(i -> i.code === :unreachable_transition && i.object_id === :score, issues)
+    end
+
+    @testset "keyed-join structure" begin
+        join_by = (pid, token) -> token.payload
+        net = Net(
+            Dict(:left => Place(:left), :right => Place(:right), :done => Place(:done)),
+            Dict(:join => Transition(:join; join_by=join_by)),
+            [ArcFrom(:join, :left), ArcFrom(:join, :right)],
+            [ArcTo(:join, :done)],
+        )
+
+        @test isempty(validate(net))
+    end
+
+    @testset "duplicate input arcs are reported by validate" begin
+        join_by = (pid, token) -> token.payload
+        net = Net(
+            Dict(:left => Place(:left), :done => Place(:done)),
+            Dict(:join => Transition(:join; join_by=join_by)),
+            [ArcFrom(:join, :left), ArcFrom(:join, :left, 2)],
+            [ArcTo(:join, :done)],
+        )
+
+        issues = validate(net)
+        @test any(i -> i.code === :duplicate_input_arc && i.object_id === :join, issues)
+        @test any(i -> i.code === :invalid_keyed_join && i.object_id === :join, issues)
+    end
+
+    @testset "invalid keyed joins with fewer than two unique inputs are reported by validate" begin
+        join_by = (pid, token) -> token.payload
+        net = Net(
+            Dict(:left => Place(:left), :done => Place(:done)),
+            Dict(:join => Transition(:join; join_by=join_by)),
+            [ArcFrom(:join, :left)],
+            [ArcTo(:join, :done)],
+        )
+
+        issues = validate(net)
+        @test any(i -> i.code === :invalid_keyed_join && i.object_id === :join, issues)
+    end
+
+    @testset "arc weights that exceed place capacity are reported" begin
+        net = Net(
+            Dict(:ready => Place(:ready, 1), :done => Place(:done, 1)),
+            Dict(:judge => Transition(:judge)),
+            [ArcFrom(:judge, :ready, 2)],
+            [ArcTo(:judge, :done, 2)],
+        )
+
+        issues = validate(net)
+        @test count(i -> i.code === :weight_exceeds_capacity, issues) == 2
     end
 end
 

@@ -2,3 +2,4 @@
 .vscode/
 LocalPreferences.toml
 Manifest.toml
+*.cov

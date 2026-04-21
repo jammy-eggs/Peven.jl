@@ -6,6 +6,7 @@ using Peven
     include("spec.jl")
     include("validation.jl")
     include("engine.jl")
+    include("readme.jl")
     include("jet.jl")
     include("aqua.jl")
 end

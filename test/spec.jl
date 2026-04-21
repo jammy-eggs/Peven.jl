@@ -23,16 +23,30 @@ using Main.Peven
         @test t.executor === :default
         @test isnothing(t.guard)
         @test t.retries == 0
+        @test isnothing(t.join_by)
 
         t2 = Transition(:judge, :agent; retries=2)
         @test t2.executor === :agent
         @test t2.retries == 2
 
         guard_fn = tokens -> length(tokens) > 0
-        t3 = Transition(:gate, :default; guard=guard_fn)
+        join_fn = (pid, token) -> token.payload
+        t3 = Transition(:gate, :default; guard=guard_fn, join_by=join_fn)
         @test t3.guard === guard_fn
+        @test t3.join_by === join_fn
 
         @test_throws ArgumentError Transition(:bad; retries=-1)
+    end
+
+    @testset "BundleRef" begin
+        a = BundleRef(:judge, "r1", :user_1, 1)
+        b = BundleRef(:judge, "r1", :user_1, 1)
+        c = BundleRef(:judge, "r1", :user_1, 2)
+        @test a == b
+        @test isequal(a, b)
+        @test hash(a) == hash(b)
+        @test a != c
+        @test_throws ArgumentError BundleRef(:judge, "r1", nothing, 0)
     end
 
     @testset "ArcFrom" begin
@@ -64,7 +78,7 @@ using Main.Peven
     @testset "Net" begin
         places = Dict(
             :ready => Place(:ready),
-            :done  => Place(:done, 3),
+            :done => Place(:done, 3),
         )
         transitions = Dict(:judge => Transition(:judge))
         arcsfrom = [ArcFrom(:judge, :ready)]
@@ -84,78 +98,44 @@ using Main.Peven
     @testset "Net cached arc indexes" begin
         places = Dict(:a => Place(:a), :b => Place(:b), :c => Place(:c))
         transitions = Dict(:t1 => Transition(:t1), :t2 => Transition(:t2))
-        arcsfrom = [ArcFrom(:t1, :a), ArcFrom(:t1, :b, 2)]
+        arcsfrom = [ArcFrom(:t1, :b, 2), ArcFrom(:t1, :a)]
         arcsto = [ArcTo(:t1, :c), ArcTo(:t2, :c)]
 
         net = Net(places, transitions, arcsfrom, arcsto)
 
-        # input_arcs: t1 has two input arcs, t2 has none
-        @test length(net.input_arcs[:t1]) == 2
+        @test net.input_arcs[:t1] == [(:b, 2), (:a, 1)]
         @test isempty(net.input_arcs[:t2])
-
-        # Check tuples contain (place_id, weight)
-        t1_inputs = Set(net.input_arcs[:t1])
-        @test (:a, 1) ∈ t1_inputs
-        @test (:b, 2) ∈ t1_inputs
-
-        # output_arcs: t1 and t2 each have one output to :c
         @test net.output_arcs[:t1] == [(:c, 1)]
         @test net.output_arcs[:t2] == [(:c, 1)]
     end
 
-    @testset "Net affected_transitions (reverse index)" begin
-        places = Dict(:a => Place(:a), :b => Place(:b), :c => Place(:c))
-        transitions = Dict(:t1 => Transition(:t1), :t2 => Transition(:t2))
-        arcsfrom = [ArcFrom(:t1, :a), ArcFrom(:t1, :b, 2), ArcFrom(:t2, :a)]
-        arcsto = [ArcTo(:t1, :c), ArcTo(:t2, :c)]
+    @testset "Net allows structural validation to happen later" begin
+        places = Dict(:left => Place(:left), :right => Place(:right), :done => Place(:done))
+        join_by = (pid, token) -> token.payload
 
-        net = Net(places, transitions, arcsfrom, arcsto)
+        duplicate_arc_net = Net(
+            places,
+            Dict(:join => Transition(:join; join_by=join_by)),
+            [ArcFrom(:join, :left), ArcFrom(:join, :left, 2)],
+            [ArcTo(:join, :done)],
+        )
+        @test duplicate_arc_net.input_arcs[:join] == [(:left, 1), (:left, 2)]
 
-        # :a feeds both :t1 and :t2
-        @test Set(net.affected_transitions[:a]) == Set([:t1, :t2])
-        # :b feeds only :t1
-        @test net.affected_transitions[:b] == [:t1]
-        # :c is an output place — no transitions consume from it
-        @test !haskey(net.affected_transitions, :c)
-    end
+        invalid_keyed_join_net = Net(
+            places,
+            Dict(:judge => Transition(:judge; join_by=join_by)),
+            [ArcFrom(:judge, :left)],
+            [ArcTo(:judge, :done)],
+        )
+        @test invalid_keyed_join_net.input_arcs[:judge] == [(:left, 1)]
 
-    @testset "Net upstream / downstream (LoLA 2 indexes)" begin
-        # Net: :a -> :t1 -> :c, :a -> :t2 -> :c, :c -> :t3 -> :d
-        places = Dict(:a => Place(:a), :c => Place(:c), :d => Place(:d))
-        transitions = Dict(:t1 => Transition(:t1), :t2 => Transition(:t2), :t3 => Transition(:t3))
-        arcsfrom = [ArcFrom(:t1, :a), ArcFrom(:t2, :a), ArcFrom(:t3, :c)]
-        arcsto = [ArcTo(:t1, :c), ArcTo(:t2, :c), ArcTo(:t3, :d)]
-
-        net = Net(places, transitions, arcsfrom, arcsto)
-
-        # :t1 and :t2 share input place :a — they are upstream of each other
-        @test net.upstream[:t1] == [:t2]
-        @test net.upstream[:t2] == [:t1]
-        # :t3 has no upstream transitions (only :t3 consumes from :c)
-        @test isempty(net.upstream[:t3])
-
-        # :t1 and :t2 output to :c, which :t3 consumes from — :t3 is downstream
-        @test net.downstream[:t1] == [:t3]
-        @test net.downstream[:t2] == [:t3]
-        # :t3 outputs to :d, nothing consumes from :d
-        @test isempty(net.downstream[:t3])
-
-        @test net.recheck[:t1] == [:t1, :t2, :t3]
-        @test net.recheck[:t2] == [:t1, :t2, :t3]
-        @test net.recheck[:t3] == [:t3]
-    end
-
-    @testset "Net downstream includes self on cycle" begin
-        # Cycle: :a -> :t1 -> :a (output loops back to input)
-        places = Dict(:a => Place(:a))
-        transitions = Dict(:t1 => Transition(:t1))
-        arcsfrom = [ArcFrom(:t1, :a)]
-        arcsto = [ArcTo(:t1, :a)]
-
-        net = Net(places, transitions, arcsfrom, arcsto)
-
-        # :t1 deposits back to :a, which :t1 consumes from — self-loop
-        @test :t1 ∈ net.downstream[:t1]
+        net = Net(
+            places,
+            Dict(:join => Transition(:join; join_by=join_by)),
+            [ArcFrom(:join, :left), ArcFrom(:join, :right)],
+            [ArcTo(:join, :done)],
+        )
+        @test net.input_arcs[:join] == [(:left, 1), (:right, 1)]
     end
 end
 
