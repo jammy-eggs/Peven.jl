@@ -24,6 +24,13 @@ Pkg.add("Peven")
 ```julia
 using Peven
 
+register_executor!(:agent, FunctionExecutor((_, tokens) ->
+    Token(:response, run_key(tokens[1]), string(tokens[1].payload, " -> draft"))
+))
+register_executor!(:judge, FunctionExecutor((_, tokens) ->
+    Token(:score, run_key(tokens[1]), length(String(tokens[1].payload)))
+))
+
 # Define the net: prompt -> generate -> response -> judge -> scored
 places = Dict(
     :prompt   => Place(:prompt),
@@ -48,6 +55,12 @@ marking = Marking(Dict(
 
 # Validate
 issues = validate(net, marking)
+isempty(issues) || error(issues[1].message)
+
+# Run
+results = fire(net, marking; max_concurrency=1)
+@assert results[1].status === :completed
+@assert length(results[1].final_marking.tokens_by_place[:scored]) == 1
 ```
 
 ## Concepts
@@ -55,24 +68,61 @@ issues = validate(net, marking)
 - **Places** -- containers that hold tokens. States or buffers.
 - **Transitions** -- actions that consume tokens from input places and produce tokens in output places. In Peven, transitions are executor calls (agents, judges).
 - **Arcs** -- directed edges connecting places to transitions and back. Always bipartite. Each arc has a weight (default 1).
-- **Tokens** -- colored data flowing through the net. Each token has a `color` label and a `run_key` for batch isolation.
+- **Tokens** -- colored data flowing through the net. In v0.4, the practical schema is:
+  - `run_key` = the batch or rollout boundary
+  - `join_by` field in the payload = the per-item correlation key for keyed joins
+  - `color` = routing / debugging / token-type signal
+  - `payload` = the content you want guards and executors to inspect
 - **Marking** -- the distribution of tokens across places at a point in time.
-- **Guards** -- functions on transitions that gate firing. A guard that returns false blocks the transition for that run_key.
-- **Firing rule** -- a transition is hot when every input place has enough tokens of the same run_key for the arc weight. Firing grabs those tokens eagerly (reservation), spawns the executor, and drops outputs on completion. The same `(transition, run_key)` may overlap when enough tokens exist. Only transitions affected by the marking change are rechecked (incremental enablement).
+- **Guards** -- functions on transitions that gate firing. Under bundle-first scheduling, a guard that returns `false` blocks that bundle, not the whole run.
+- **Bundles** -- the engine's first-class firing unit. A `BundleRef` is `(transition_id, run_key, selected_key, ordinal)`. `selected_key` is `nothing` for unkeyed transitions.
+- **Firing rule** -- a transition is hot when at least one bundle is ready. Firing grabs one concrete bundle eagerly, spawns the executor, and drops outputs on completion. Overlap is defined on disjoint bundles, not just on `(transition, run_key)`. Only transitions affected by the marking change are rechecked (incremental enablement).
+
+## Core Patterns
+
+- **`tee`** -- the canonical one-to-many fan-out idiom. One transition with multiple output arcs duplicates the executor's single returned token into several Places.
+- **Self-loop** -- a transition deposits back into one of its input Places, which is how Peven expresses retry loops and iterative refinement cycles.
+- **Keyed join** -- `Transition(...; join_by=(place_id, token) -> key)` correlates multi-place inputs within a single `run_key`, so one batch can contain many independently joined items.
+
+For keyed pipelines, the default schema is: one `run_key` per batch, one `join_by` field per item, and `color` only for routing/debugging.
+
+### Rubric Pipeline Pattern
+
+This is the canonical eval shape for `tee` plus keyed join:
+
+- `:tee` duplicates each problem token into `:problem` and `:rubric_seed`
+- `:make_rubric` turns `:rubric_seed` into `:rubric`
+- `:judge` consumes from `:problem` and `:rubric` with `join_by=(pid, token) -> token.payload.problem_id`
+
+That keeps problem/rubric pairing correct even when rubric generation completes out of order.
 
 ## Engine API
 
 | Function | What it does |
 |---|---|
 | `fuses(marking)` | Collect unique run_keys from the initial marking |
-| `hot(net, marking)` | Which (transition, run_key) pairs are ready to fire |
-| `cold(net, marking)` | Which transitions cannot fire — the inverse of `hot` |
-| `grab(marking, net, tid, rk)` | Return `(new_marking, grabbed, grabbed_by_place)` or `nothing` if not enabled |
-| `take(marking, net, tid, rk)` | Same as `grab`, but throws `ArgumentError` instead of returning `nothing` |
+| `enablement(net, marking)` | Return bundle-level readiness records with `bundle`, `status`, `inputs`, and `error` |
+| `hot(net, marking)` | Which concrete `BundleRef`s are ready to fire |
+| `cold(net, marking)` | Which transitions have no ready bundle — the inverse of `hot` |
+| `grab(marking, net, bundle)` | Return `(new_marking, grabbed, grabbed_by_place)` or `nothing` if that bundle is stale/unavailable |
+| `take(marking, net, bundle)` | Same as `grab`, but throws `ArgumentError("stale or unavailable bundle")` |
 | `fire(net, marking; ...)` | Run the engine to completion and return `Vector{RunResult}` |
 | `drop(marking, net, tid, token)` | Deposit output token into output places |
 | `drop(marking, net, tid, outputs)` | Deposit many output tokens into one output place |
 | `misfire(marking, consumed)` | Return consumed tokens after executor failure |
+| `completed_firings(result)` | Project completed `TransitionResult` rows from a `RunResult` |
+| `failed_firings(result)` | Project ordinary failed `TransitionResult` rows from a `RunResult` |
+| `fuse_blocked_firings(result)` | Project `TransitionResult` rows that stopped because fuse exhaustion blocked a retry |
+| `firing_result(result, firing_id)` | Look up a launched firing by durable `firing_id` |
+| `firing_status(result, firing_id)` | Look up the terminal status for one launched firing |
+
+`BundleRef` is snapshot-scoped. Using it against a later marking is stale by definition:
+
+- `grab(...)` returns `nothing`
+- `take(...)` throws
+
+Peven keeps scheduler identity internally with admission ids, but the public `BundleRef.ordinal` is intentionally only meaningful for the snapshot that produced it. For durable post-launch inspection, use `firing_id`, not `BundleRef`.
+`fuses(marking)` and the returned `RunResult`s are ordered lexicographically by `run_key`.
 
 ## Performance
 
@@ -83,23 +133,34 @@ Peven uses precomputed per-transition influence sets (LoLA 2's incremental enabl
 Transitions look up executors by their `executor::Symbol` in a process-global registry.
 For custom executors, subtype `AbstractExecutor`, extend `Peven.execute`, and register an instance with `register_executor!`.
 Executors may return one token or a vector of tokens. Vector outputs are valid only for transitions with exactly one output arc of weight `1`.
-`fire` now treats retries as new launches for fuse accounting, and event / trace records expose `firing_id` plus `attempt` metadata for each firing.
+Executors and guards still receive `Vector{T}` inputs. Under keyed joins that vector is now the selected bundle.
+Executors must keep outputs inside the initial `run_key` set for v0.4. Emitting a token with a new `run_key` is treated as a launched-firing failure.
+`fire` treats retries as new launches for fuse accounting, and event / trace records expose `bundle`, `firing_id`, plus `attempt` metadata for each launched firing.
 
 ## Events and traces
 
-`TransitionStarted`, `TransitionCompleted`, and `TransitionFailed` are emitted through `on_event` for launched firings only.
-Guard exceptions now emit `GuardErrored` instead of being reported as synthetic transition failures.
-Completed events and `TransitionResult`s now carry `outputs::Vector{T}` so scalar and vector executor returns share one shape.
-Each firing also has a stable `firing_id`, and retries increment `attempt` while keeping the same `firing_id`.
-`TransitionResult.trace` now contains launched firings only; guard exceptions do not allocate firing ids or create trace rows.
+`TransitionStarted`, `TransitionCompleted`, and `TransitionFailed` are emitted through `on_event` for launched firings only, and each now carries a `bundle::BundleRef`.
+Guard exceptions emit `GuardErrored(bundle, error)`. Selector exceptions emit `SelectionErrored(transition_id, run_key, error)`.
+Completed events and `TransitionResult`s carry `outputs::Vector{T}` so scalar and vector executor returns share one shape.
+Each launched firing has a stable `firing_id`, and retries increment `attempt` while keeping that same `firing_id`.
+`TransitionResult.trace` contains launched firings only; guard and selection observations do not allocate firing ids or create fake trace rows. Each trace row is one terminal lifecycle row per launched `firing_id`, with `status === :completed`, `:failed`, or `:fuse_blocked`.
 
 `hot` and `cold` remain stateless snapshot helpers. Their optional `on_guard_error` callback is per-call and non-deduplicated.
-`fire` owns guard-error lifecycle state and emits `GuardErrored` only when a `(transition, run_key)` pair enters an active guard-error state.
+`fire` owns guard-error lifecycle state and emits `GuardErrored` only when a bundle enters an active guard-error state. `on_event` is observational only; ordinary hook exceptions are swallowed and never fail the scheduler.
 
 ## Validation
 
-`validate(net)` checks structural integrity: key consistency, place endpoint references, and orphan places.
+`validate(net)` checks structural integrity: key consistency, place endpoint references, orphan places, keyed-join structure, duplicate input arcs, and arc weights that exceed bounded place capacity.
 `validate(net, marking)` adds marking checks (unknown places, capacity) and reachability (dead transitions).
+
+Structural keyed-join issues are reported by `validate(...)`; `Net(...)` construction keeps only local field invariants.
+
+v0.4 validation rules include:
+
+- `join_by` is valid only on transitions with at least two unique input Places
+- duplicate input arcs for the same `(transition, place)` are rejected; use `weight` instead
+- input or output arc weights may not exceed the capacity of a bounded connected Place
+- `ArcFrom` declaration order is no longer semantic for joins; bundle ordering is canonicalized by Place id and token order
 
 ```julia
 issues = validate(net, marking)
@@ -109,10 +170,37 @@ issues = validate(net, marking)
 ## Run outcomes
 
 - `completed` -- all tokens reached terminal places
-- `failed` -- an executor failed after retries were exhausted, or an active guard exception remained at shutdown
+- `failed` -- a selector errored, an executor failed after retries were exhausted, or an active guard exception remained at shutdown
 - `incomplete` -- tokens remain in nonterminal places because no transition is enabled or the fuse budget was exhausted
 
-`RunResult.terminal_reason` is one of `:executor_failed`, `:guard_error`, `:fuse_exhausted`, or `:no_enabled_transition`.
+`RunResult.terminal_reason` is one of `:selection_error`, `:executor_failed`, `:guard_error`, `:fuse_exhausted`, or `:no_enabled_transition`.
+
+Under keyed joins, `RunResult.status` is intentionally a pessimistic run-level roll-up. A single failed bundle can make the run `:failed` even if many sibling bundles completed successfully. The trace is the per-firing source of truth:
+
+- `result.trace` tells you what actually launched and how each launched firing ended
+- `result.terminal_bundle` points at the bundle-level cause for `:executor_failed` or `:guard_error`
+- `result.terminal_transition` points at the transition that raised `:selection_error`
+- `completed_firings`, `failed_firings`, `fuse_blocked_firings`, `firing_result`, and `firing_status` are the fast way to inspect keyed runs without replaying the trace yourself
+
+## Keyed-Join Guide
+
+`join_by` is classification, not evaluation. It groups tokens from multiple input Places into correlated bundles inside one `run_key`.
+
+- Keep one `run_key` per batch
+- Put the per-item correlation key in the token payload
+- Use `join_by=(place_id, token) -> token.payload.item_id` or the equivalent field in your token type
+- Keep the selector pure, deterministic, and non-`nothing`; `nothing` is reserved for unkeyed transitions and becomes a selection error at runtime
+
+Canonical ordering for keyed bundles does not depend on `ArcFrom` declaration order. Surviving ready bundles keep queue order across rescans, and newly enabled bundles append at the tail in canonical bundle order.
+
+## Deferred
+
+Read arcs are explicitly out of scope for v0.4. The next design pass needs to answer:
+
+- whether read arcs participate in bundle identity
+- whether read-arc consumers share or duplicate bundle selection
+- whether read-arc reads are snapshot-consistent with claimed write arcs
+- how read arcs affect fairness and overlap when the same tokens are simultaneously observed and claimed
 
 ## Tests
 

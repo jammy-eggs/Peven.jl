@@ -31,6 +31,8 @@ end
 function validate!(issues::Vector{ValidationIssue}, net::Net)
     validate_keys!(issues, net)
     validate_arcs!(issues, net)
+    validate_keyed_join_structure!(issues, net)
+    validate_arc_capacity!(issues, net)
     validate_orphan_places!(issues, net)
     return issues
 end
@@ -53,8 +55,9 @@ end
 issue_capacity(net::Net) = (
     length(net.places) +
     length(net.transitions) +
-    2 * length(net.arcsfrom) +
-    2 * length(net.arcsto)
+    length(net.arcsfrom) +
+    3 * length(net.arcsfrom) +
+    3 * length(net.arcsto)
 )
 
 issue_capacity(net::Net, marking::Marking) = (
@@ -123,6 +126,74 @@ function validate_arcs!(issues::Vector{ValidationIssue}, net::Net)
     for arc in net.arcsto
         validate!(issues, arc, net)
     end
+    return issues
+end
+
+# ── Keyed-join structure ─────────────────────────────────────────────────────
+
+"""
+    Keyed joins require at least two unique input places
+    Duplicate input arcs for the same (transition, place) are rejected; use weight instead
+"""
+function validate_keyed_join_structure!(issues::Vector{ValidationIssue}, net::Net)
+    seen_inputs = Set{Tuple{Symbol,Symbol}}()
+    unique_inputs = Dict{Symbol,Set{Symbol}}()
+
+    for arc in net.arcsfrom
+        key = (arc.transition, arc.from)
+        key in seen_inputs && push_issue!(
+            issues,
+            :duplicate_input_arc,
+            arc.transition,
+            "transition :$(arc.transition) has duplicate input arcs from place :$(arc.from); use weight instead",
+        )
+        push!(seen_inputs, key)
+        push!(get!(()->Set{Symbol}(), unique_inputs, arc.transition), arc.from)
+    end
+
+    for (tid, transition) in net.transitions
+        isnothing(transition.join_by) && continue
+        nunique = length(get(unique_inputs, tid, Set{Symbol}()))
+        nunique >= 2 || push_issue!(
+            issues,
+            :invalid_keyed_join,
+            tid,
+            "transition :$tid uses join_by but has fewer than 2 unique input places",
+        )
+    end
+
+    return issues
+end
+
+"""
+    Arc weights must not exceed the bounded capacity of their connected place
+    Otherwise the transition can never consume or deposit enough tokens successfully
+"""
+function validate_arc_capacity!(issues::Vector{ValidationIssue}, net::Net)
+    for arc in net.arcsfrom
+        place = get(net.places, arc.from, nothing)
+        if !isnothing(place) && !isnothing(place.capacity) && arc.weight > place.capacity
+            push_issue!(
+                issues,
+                :weight_exceeds_capacity,
+                arc.transition,
+                "input arc from :$(arc.from) requires weight $(arc.weight) but place capacity is $(place.capacity)",
+            )
+        end
+    end
+
+    for arc in net.arcsto
+        place = get(net.places, arc.to, nothing)
+        if !isnothing(place) && !isnothing(place.capacity) && arc.weight > place.capacity
+            push_issue!(
+                issues,
+                :weight_exceeds_capacity,
+                arc.transition,
+                "output arc to :$(arc.to) deposits weight $(arc.weight) but place capacity is $(place.capacity)",
+            )
+        end
+    end
+
     return issues
 end
 

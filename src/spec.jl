@@ -26,17 +26,73 @@ end
     Retries are transition retries, not API retries, encoded into the Net
     They can be paired with Guards to provide n chances to transition from Place A to Place B
     Retries are optional — certain experiments might favor a total rollout budget governing all steps
+
+    join_by is an optional bundle selector for keyed joins across multiple input Places
+    The selector is classification, not evaluation: it maps `(place_id, token)` to a key
+    Keys must be hash/isequal-stable, and the selector should be pure and deterministic
 """
 struct Transition
     id::Symbol
     executor::Symbol
     guard::Union{Nothing,Function}
     retries::Int
+    join_by::Union{Nothing,Function}
 
-    function Transition(id::Symbol, executor::Symbol=:default; guard=nothing, retries::Int=0)
+    function Transition(
+        id::Symbol,
+        executor::Symbol=:default;
+        guard=nothing,
+        retries::Int=0,
+        join_by=nothing,
+    )
         retries >= 0 || throw(ArgumentError("retries must be non-negative"))
-        new(id, executor, guard, retries)
+        new(id, executor, guard, retries, join_by)
     end
+end
+
+"""
+    BundleRef identifies one concrete firing bundle in a marking snapshot
+    selected_key is `nothing` for unkeyed transitions
+    ordinal is snapshot-scoped within `(transition_id, run_key, selected_key)`
+"""
+struct BundleRef
+    transition_id::Symbol
+    run_key::String
+    selected_key::Any
+    ordinal::Int
+
+    function BundleRef(
+        transition_id::Symbol,
+        run_key::String,
+        selected_key,
+        ordinal::Int,
+    )
+        ordinal > 0 || throw(ArgumentError("bundle ordinal must be positive"))
+        new(transition_id, run_key, selected_key, ordinal)
+    end
+end
+
+Base.:(==)(a::BundleRef, b::BundleRef) = (
+    a.transition_id === b.transition_id &&
+    a.run_key == b.run_key &&
+    isequal(a.selected_key, b.selected_key) &&
+    a.ordinal == b.ordinal
+)
+Base.isequal(a::BundleRef, b::BundleRef) = a == b
+Base.hash(bundle::BundleRef, h::UInt) = hash(
+    (bundle.transition_id, bundle.run_key, bundle.selected_key, bundle.ordinal),
+    h,
+)
+
+"""
+    Public bundle-level readiness record returned by enablement()
+    status is :ready, :guard_blocked, or :guard_errored
+"""
+struct BundleEnablement{T<:AbstractToken}
+    bundle::BundleRef
+    status::Symbol
+    inputs::Vector{T}
+    error::Union{Nothing,String}
 end
 
 """
@@ -181,6 +237,7 @@ end
 
 """
     Net is the complete Petri net graph — Places, Transitions, and Arcs
+    Construction caches indexes for runtime use, but structural net issues are reported by `validate(net)`
     Caches indexes at construction for fast runtime access:
       children:               adjacency list for reachability checks
       input_arcs:             Transition -> [(Place, weight)] for consumption
