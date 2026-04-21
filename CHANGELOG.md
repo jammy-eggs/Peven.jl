@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.4.1
+
+- Remove weighted output arcs and make branched transition outputs explicit per destination place
+- Treat tokens as linear: one firing consumes input tokens once, and multi-place branching now requires explicit per-place emissions instead of implicit fanout duplication
+- Tighten the public engine surface by removing low-value helper APIs and keeping adapter-facing semantics behind the canonical engine operations
+- Add public helpers and cleanup around executor lifecycle, run slicing, and output/result shapes so adapters can stay thinner without mirroring scheduler rules
+- Collapse the runtime internals back into a single `engine.jl`, which is a better fit for Julia's file/module model than pretending file splits create private boundaries
+- Harden runtime correctness around commit failure rollback, ready-queue ordering, and copy-on-write marking independence
+- Reduce hot-path overhead in enablement scans, bundle claiming, queue handling, and post-run summarization without changing engine semantics
+- Strengthen the engine test suite around output-shape contracts, queue behavior, and run-key ordering, and keep the package green under `Pkg.test()` with JET and Aqua
+
 ## v0.4.0
 
 - Make scheduling bundle-first: the engine now reasons in concrete `BundleRef`s instead of plain `(transition, run_key)` pairs

@@ -1,13 +1,10 @@
 """
-    Events emitted during engine execution via the on_event hook
-    Pass `on_event = e -> push!(log, e)` to `fire()` to capture them
-    Event hooks are observational only; ordinary hook exceptions are swallowed
+    Base type for events emitted via `fire(...; on_event=...)`.
 """
 abstract type EngineEvent end
 
 """
-    Emitted when a transition begins executing
-    bundle identifies the launched bundle and inputs contains the reserved tokens for that firing
+    Event emitted when a transition begins executing.
 """
 struct TransitionStarted{T<:AbstractToken} <: EngineEvent
     bundle::BundleRef
@@ -17,19 +14,17 @@ struct TransitionStarted{T<:AbstractToken} <: EngineEvent
 end
 
 """
-    Emitted when a transition completes successfully
-    bundle identifies the launched bundle and outputs contains the executor's return tokens
+    Event emitted when a transition completes successfully.
 """
 struct TransitionCompleted{T<:AbstractToken} <: EngineEvent
     bundle::BundleRef
     firing_id::Int
     attempt::Int
-    outputs::Vector{T}
+    outputs::Dict{Symbol,Vector{T}}
 end
 
 """
-    Emitted when a launched bundle fails
-    retrying is true if the firing will be re-attempted, false if retries are exhausted or fuse blocked
+    Event emitted when a launched bundle fails.
 """
 struct TransitionFailed <: EngineEvent
     bundle::BundleRef
@@ -40,8 +35,7 @@ struct TransitionFailed <: EngineEvent
 end
 
 """
-    Emitted when a bundle's guard throws during enablement evaluation
-    Guard exceptions are scheduler observations, not launched firings
+    Event emitted when a bundle guard throws during enablement evaluation.
 """
 struct GuardErrored <: EngineEvent
     bundle::BundleRef
@@ -49,7 +43,7 @@ struct GuardErrored <: EngineEvent
 end
 
 """
-    Emitted when join_by classification throws before a bundle can be formed
+    Event emitted when `join_by` throws before a bundle can be formed.
 """
 struct SelectionErrored <: EngineEvent
     transition_id::Symbol
@@ -57,41 +51,20 @@ struct SelectionErrored <: EngineEvent
     error::String
 end
 
-@inline emit(::Nothing, _) = nothing
-@inline function emit(hook, event)
-    try
-        hook(event)
-    catch e
-        e isa InterruptException && rethrow()
-        nothing
-    end
-end
-
 """
-    Record of one launched firing's terminal lifecycle outcome kept in a run trace
-    status is :completed, :failed, or :fuse_blocked
-    bundle identifies the launched bundle
-    outputs holds the executor's return tokens on success, error holds the message on failure
-    retries are summarized into attempts; trace stores one row per launched firing_id
+    Terminal outcome for one launched firing recorded in a run trace.
 """
 struct TransitionResult{T<:AbstractToken}
     bundle::BundleRef
     firing_id::Int
     status::Symbol
-    outputs::Vector{T}
+    outputs::Dict{Symbol,Vector{T}}
     error::Union{Nothing,String}
     attempts::Int
 end
 
 """
-    Final result for one run_key after the engine finishes
-    status is :completed, :failed, or :incomplete
-    terminal_reason explains why:
-      :selection_error, :executor_failed, :guard_error, :fuse_exhausted, :no_enabled_transition
-    terminal_bundle is populated for bundle-scoped terminal reasons like :executor_failed or :guard_error
-    terminal_transition is populated for pre-classification failures like :selection_error
-    trace contains launched firings only; it does not include guard or selection observations
-    final_marking keeps only this run_key's tokens when fire() stopped
+    Final result for one `run_key` after the engine stops.
 """
 struct RunResult{T<:AbstractToken}
     run_key::String
@@ -105,32 +78,32 @@ struct RunResult{T<:AbstractToken}
 end
 
 """
-    Emitted once per run_key when the engine finishes processing it
+    Event emitted once per `run_key` when processing finishes.
 """
 struct RunFinished{T<:AbstractToken} <: EngineEvent
     result::RunResult{T}
 end
 
-completed_firings(result::RunResult) = TransitionResult[
+completed_firings(result::RunResult{T}) where {T<:AbstractToken} = TransitionResult{T}[
     step for step in result.trace if step.status === :completed
 ]
 
-failed_firings(result::RunResult) = TransitionResult[
+failed_firings(result::RunResult{T}) where {T<:AbstractToken} = TransitionResult{T}[
     step for step in result.trace if step.status === :failed
 ]
 
-fuse_blocked_firings(result::RunResult) = TransitionResult[
+fuse_blocked_firings(result::RunResult{T}) where {T<:AbstractToken} = TransitionResult{T}[
     step for step in result.trace if step.status === :fuse_blocked
 ]
 
-function firing_result(result::RunResult, firing_id::Int)
+function firing_result(result::RunResult{T}, firing_id::Int) where {T<:AbstractToken}
     for step in result.trace
         step.firing_id == firing_id && return step
     end
     return nothing
 end
 
-firing_status(result::RunResult, firing_id::Int) = begin
+firing_status(result::RunResult{T}, firing_id::Int) where {T<:AbstractToken} = begin
     step = firing_result(result, firing_id)
     isnothing(step) ? nothing : step.status
 end

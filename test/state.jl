@@ -47,6 +47,47 @@ using Main.Peven
         typed_empty = Marking{AbstractToken}()
         @test typed_empty isa Marking{AbstractToken}
     end
+
+    @testset "run_keys" begin
+        @test run_keys(Marking()) == String[]
+
+        m = Marking(Dict(
+            :ready => Token[Token(:red, "r1", 1), Token(:red, "r2", 2), Token(:red, "r1", 3)],
+            :done  => Token[Token(:gold, "r3", 4)],
+        ))
+        keys_out = run_keys(m)
+        @test keys_out == ["r1", "r2", "r3"]
+
+        single_place = Marking(Dict(
+            :ready => Token[
+                Token(:red, "r2", 1),
+                Token(:red, "r1", 2),
+                Token(:red, "r2", 3),
+                Token(:red, "r3", 4),
+            ],
+        ))
+        @test run_keys(single_place) == ["r2", "r1", "r3"]
+    end
+
+    @testset "run_marking" begin
+        m = Marking(Dict(
+            :ready => Token[Token(:red, "r1", 1), Token(:red, "r2", 2)],
+            :done  => Token[Token(:gold, "r1", 3)],
+        ))
+
+        sliced = run_marking(m, "r1")
+        @test sliced isa Marking{Token}
+        @test length(sliced.tokens_by_place[:ready]) == 1
+        @test sliced.tokens_by_place[:ready][1].payload == 1
+        @test length(sliced.tokens_by_place[:done]) == 1
+        @test sliced.tokens_by_place[:done][1].payload == 3
+
+        only_ready = run_marking(m, "r2")
+        @test haskey(only_ready.tokens_by_place, :ready)
+        @test !haskey(only_ready.tokens_by_place, :done)
+
+        @test isempty(run_marking(m, "missing").tokens_by_place)
+    end
 end
 
 end

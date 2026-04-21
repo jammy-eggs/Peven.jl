@@ -32,14 +32,6 @@ function branch_net()
     return Net(places, transitions, arcsfrom, arcsto)
 end
 
-function weighted_output_net()
-    places = Dict(:ready => Place(:ready), :done => Place(:done))
-    transitions = Dict(:judge => Transition(:judge))
-    arcsfrom = [ArcFrom(:judge, :ready)]
-    arcsto = [ArcTo(:judge, :done, 2)]
-    return Net(places, transitions, arcsfrom, arcsto)
-end
-
 function unkeyed_join_net(; guard=nothing, retries=0, arc_order=[:left, :right])
     places = Dict(:left => Place(:left), :right => Place(:right), :done => Place(:done))
     transitions = Dict(:join => Transition(:join; guard=guard, retries=retries))
@@ -97,30 +89,29 @@ function with_executor(f, name::Symbol, executor)
     try
         f()
     finally
-        delete!(Peven.EXECUTOR_REGISTRY, name)
+        unregister_executor!(name)
     end
 end
 
 passthrough(tid, tokens) = Token(color(tokens[1]), run_key(tokens[1]), (item=item_id(tokens[1]), transition=tid))
 
+queued_ready_ids(state) = Int[
+    id for (id, version) in state.ready[state.ready_head:end]
+    if id in state.ready_set && get(state.ready_versions, id, 0) == version
+]
+
 @testset "src/engine" begin
-    @testset "evaluate_guard" begin
-        @test evaluate_guard(nothing, []) == true
-        @test evaluate_guard(ts -> length(ts) > 0, [Token("r1")]) == true
-        @test evaluate_guard(ts -> length(ts) > 5, [Token("r1")]) == false
-    end
-
-    @testset "emit swallows ordinary hook errors but rethrows interrupts" begin
-        @test emit(_ -> error("boom"), :event) === nothing
-        @test_throws InterruptException emit(_ -> throw(InterruptException()), :event)
-    end
-
     @testset "drop and misfire basics" begin
         net = chain_net()
-        marking = Marking(Dict(:ready => Token[Token(:red, "r1", 1)]))
+        marking = Marking(Dict(
+            :ready => Token[Token(:red, "r1", 1)],
+            :untouched => Token[Token(:blue, "r1", "keep")],
+        ))
         output = Token(:red, "r1", "result")
         new_marking = drop(marking, net, :judge, output)
         @test new_marking.tokens_by_place[:done][1].payload == "result"
+        push!(new_marking.tokens_by_place[:untouched], Token(:blue, "r1", "new"))
+        @test length(marking.tokens_by_place[:untouched]) == 1
 
         restored = misfire(Marking(Dict(:ready => Token[])), Dict(:ready => Token[Token("r1")]))
         @test length(restored.tokens_by_place[:ready]) == 1
@@ -133,14 +124,33 @@ passthrough(tid, tokens) = Token(color(tokens[1]), run_key(tokens[1]), (item=ite
         @test [token.payload for token in marking.tokens_by_place[:done]] == ["a", "b"]
     end
 
-    @testset "fuses and run_completed" begin
+    @testset "drop explicit per-place outputs routes tokens separately" begin
+        net = branch_net()
+        outputs = Dict(
+            :left => Token[Token(:red, "r1", "a")],
+            :right => Token[Token(:red, "r1", "b")],
+        )
+        marking = drop(Marking(), net, :judge, outputs)
+        @test [token.payload for token in marking.tokens_by_place[:left]] == ["a"]
+        @test [token.payload for token in marking.tokens_by_place[:right]] == ["b"]
+    end
+
+    @testset "run_keys ordering" begin
         marking = Marking(Dict(
             :a => Token[Token(:red, "r2", 1), Token(:blue, "r10", 2)],
             :b => Token[Token(:red, "r1", 3)],
         ))
-        @test fuses(marking) == ["r1", "r10", "r2"]
-        @test !Peven.run_completed(Marking(Dict(:ready => Token[Token("r1")])), "r1", Set([:ready]))
-        @test Peven.run_completed(Marking(Dict(:done => Token[Token("r1")])), "r1", Set([:ready]))
+        @test sort(run_keys(marking)) == ["r1", "r10", "r2"]
+    end
+
+    @testset "fire ignores ordinary on_event hook errors" begin
+        net = chain_net()
+        marking = Marking(Dict(:ready => Token[batch_token(:ready, "r1", :a)]))
+        with_executor(:default, FunctionExecutor(passthrough)) do
+            results = fire(net, marking; max_concurrency=1, on_event=_ -> error("boom"))
+            @test length(results) == 1
+            @test results[1].status === :completed
+        end
     end
 
     @testset "enablement: unkeyed chain returns bundle records" begin
@@ -251,7 +261,7 @@ passthrough(tid, tokens) = Token(color(tokens[1]), run_key(tokens[1]), (item=ite
         ))
         state = Peven._scheduler_state(initial)
         Peven._refresh_enablement!(state, net, [:join])
-        @test [state.available[id].bundle.selected_key for id in state.ready] == [:a, :b]
+        @test [state.available[id].bundle.selected_key for id in queued_ready_ids(state)] == [:a, :b]
 
         state.marking = Marking(Dict(
             :left => Token[
@@ -266,7 +276,23 @@ passthrough(tid, tokens) = Token(color(tokens[1]), run_key(tokens[1]), (item=ite
             ],
         ))
         Peven._refresh_enablement!(state, net, [:join])
-        @test [state.available[id].bundle.selected_key for id in state.ready] == [:a, :b, :c]
+        @test [state.available[id].bundle.selected_key for id in queued_ready_ids(state)] == [:a, :b, :c]
+    end
+
+    @testset "ready queue re-enabled bundles append at the tail" begin
+        state = Peven._scheduler_state(Marking())
+        first = BundleEnablement(BundleRef(:join, "r1", :a, 1), :ready, Token[], nothing)
+        second = BundleEnablement(BundleRef(:join, "r1", :b, 1), :ready, Token[], nothing)
+        state.available[1] = first
+        state.available[2] = second
+
+        Peven._set_ready_membership!(state, 1, true)
+        Peven._set_ready_membership!(state, 2, true)
+        Peven._set_ready_membership!(state, 1, false)
+        Peven._set_ready_membership!(state, 1, true)
+
+        @test Peven._pop_ready!(state) == 2
+        @test Peven._pop_ready!(state) == 1
     end
 
     @testset "grab/take: exact bundle reservation and stale bundle behavior" begin
@@ -311,6 +337,8 @@ passthrough(tid, tokens) = Token(color(tokens[1]), run_key(tokens[1]), (item=ite
             completed = only([e for e in events if e isa TransitionCompleted])
             @test started.bundle == completed.bundle == results[1].trace[1].bundle
             @test started.firing_id == completed.firing_id == results[1].trace[1].firing_id
+            @test collect(keys(completed.outputs)) == [:done]
+            @test completed.outputs == results[1].trace[1].outputs
         end
     end
 
@@ -425,8 +453,7 @@ passthrough(tid, tokens) = Token(color(tokens[1]), run_key(tokens[1]), (item=ite
 
         state.available[1] = record
         state.available_triples[Peven._bundle_triple(bundle)] = [1]
-        push!(state.ready, 1)
-        push!(state.ready_set, 1)
+        Peven._set_ready_membership!(state, 1, true)
         run = Peven._get_or_create_run_progress!(state, "r1")
         run.active_guard_errors[1] = Peven._GuardErrorEpisode("old", 1, 1)
 
@@ -437,12 +464,72 @@ passthrough(tid, tokens) = Token(color(tokens[1]), run_key(tokens[1]), (item=ite
 
         @test isnothing(get(state.available, 1, nothing))
         @test !haskey(state.available_triples, Peven._bundle_triple(bundle))
-        @test isempty(state.ready)
+        @test isnothing(Peven._pop_ready!(state))
         @test isempty(state.ready_set)
         @test isempty(run.active_guard_errors)
         @test !isnothing(run.selection_error)
         @test run.selection_error.transition_id === :join
         @test run.selection_error.message == "selector boom"
+    end
+
+    @testset "fire: claim-time selector exceptions emit SelectionErrored and spare sibling runs" begin
+        selector = (pid, token) -> getproperty(token.payload, :item)
+        net = Net(
+            Dict(
+                :seed => Place(:seed),
+                :left => Place(:left),
+                :right => Place(:right),
+                :done => Place(:done),
+            ),
+            Dict(
+                :a_poison => Transition(:a_poison),
+                :join => Transition(:join; join_by=selector),
+            ),
+            [
+                ArcFrom(:a_poison, :seed),
+                ArcFrom(:join, :left),
+                ArcFrom(:join, :right),
+            ],
+            [
+                ArcTo(:a_poison, :left),
+                ArcTo(:join, :done),
+            ],
+        )
+        marking = Marking(Dict(
+            :seed => Token[Token(:seed, "bad_run", (seed=true,))],
+            :left => Token[
+                Token(:left, "bad_run", (item=:ok, left=1)),
+                Token(:left, "good_run", (item=:ok, left=2)),
+            ],
+            :right => Token[
+                Token(:right, "bad_run", (item=:ok, right=10)),
+                Token(:right, "good_run", (item=:ok, right=20)),
+            ],
+        ))
+        events = EngineEvent[]
+        executor = FunctionExecutor((tid, tokens) -> begin
+            if tid === :a_poison
+                return Token(:left, run_key(tokens[1]), (payload=1,))
+            end
+            left, right = tokens
+            return Token(:done, run_key(left), (item=left.payload.item, total=left.payload.left + right.payload.right))
+        end)
+        with_executor(:default, executor) do
+            results = Dict(result.run_key => result for result in fire(
+                net,
+                marking;
+                max_concurrency=1,
+                on_event=e -> push!(events, e),
+            ))
+            @test results["bad_run"].status === :failed
+            @test results["bad_run"].terminal_reason === :selection_error
+            @test results["bad_run"].terminal_transition === :join
+            @test isnothing(results["bad_run"].terminal_bundle)
+            @test results["good_run"].status === :completed
+            selection = only([e for e in events if e isa SelectionErrored])
+            @test selection.transition_id === :join
+            @test selection.run_key == "bad_run"
+        end
     end
 
     @testset "fire: retries keep the same bundle and firing identity" begin
@@ -492,7 +579,10 @@ passthrough(tid, tokens) = Token(color(tokens[1]), run_key(tokens[1]), (item=ite
                     Token(color(tokens[1]), run_key(tokens[1]), "bad_b"),
                 ]
             end
-            return Token(color(tokens[1]), run_key(tokens[1]), "good")
+            return Dict(
+                :left => Token[Token(color(tokens[1]), run_key(tokens[1]), "good_left")],
+                :right => Token[Token(color(tokens[1]), run_key(tokens[1]), "good_right")],
+            )
         end)
         with_executor(:default, executor) do
             results = fire(net, marking; max_concurrency=1, on_event=e -> push!(events, e))
@@ -610,7 +700,10 @@ passthrough(tid, tokens) = Token(color(tokens[1]), run_key(tokens[1]), (item=ite
             ],
         ))
         events = EngineEvent[]
-        executor = FunctionExecutor((_, tokens) -> Token(:loop, run_key(tokens[1]), (item=item_id(tokens[1]),)))
+        executor = FunctionExecutor((_, tokens) -> Dict(
+            :left => Token[Token(:loop, run_key(tokens[1]), (item=item_id(tokens[1]),))],
+            :right => Token[Token(:loop, run_key(tokens[1]), (item=item_id(tokens[1]),))],
+        ))
         with_executor(:default, executor) do
             fire(net, marking; max_concurrency=1, fuse=9, on_event=e -> push!(events, e))
             started = [e.bundle.selected_key for e in events if e isa TransitionStarted]
@@ -624,7 +717,10 @@ passthrough(tid, tokens) = Token(color(tokens[1]), run_key(tokens[1]), (item=ite
             :left => Token[batch_token(:left, "batch_1", :a)],
             :right => Token[batch_token(:right, "batch_1", :a)],
         ))
-        executor = FunctionExecutor((_, tokens) -> Token(:loop, run_key(tokens[1]), (item=item_id(tokens[1]),)))
+        executor = FunctionExecutor((_, tokens) -> Dict(
+            :left => Token[Token(:loop, run_key(tokens[1]), (item=item_id(tokens[1]),))],
+            :right => Token[Token(:loop, run_key(tokens[1]), (item=item_id(tokens[1]),))],
+        ))
         with_executor(:default, executor) do
             results = fire(net, marking; max_concurrency=1, fuse=2)
             @test length(results[1].trace) == 2
@@ -645,14 +741,30 @@ passthrough(tid, tokens) = Token(color(tokens[1]), run_key(tokens[1]), (item=ite
         ])
         with_executor(:default, executor) do
             results = fire(net, marking; max_concurrency=1)
-            @test [token.payload for token in results[1].trace[1].outputs] == ["a", "b"]
+            @test [token.payload for token in results[1].trace[1].outputs[:done]] == ["a", "b"]
             @test [token.payload for token in results[1].final_marking.tokens_by_place[:done]] == ["a", "b"]
         end
     end
 
-    @testset "fire: invalid vector outputs become launched-firing failures" begin
+    @testset "fire: explicit per-place outputs drive branched transitions" begin
         branch = branch_net()
-        weighted = weighted_output_net()
+        marking = Marking(Dict(:ready => Token[Token("r1")]))
+        executor = FunctionExecutor((_, tokens) -> Dict(
+            :left => Token[Token(color(tokens[1]), run_key(tokens[1]), "a")],
+            :right => Token[Token(color(tokens[1]), run_key(tokens[1]), "b")],
+        ))
+        with_executor(:default, executor) do
+            branch_results = fire(branch, marking; max_concurrency=1)
+            @test branch_results[1].status === :completed
+            @test [token.payload for token in branch_results[1].trace[1].outputs[:left]] == ["a"]
+            @test [token.payload for token in branch_results[1].trace[1].outputs[:right]] == ["b"]
+            @test [token.payload for token in branch_results[1].final_marking.tokens_by_place[:left]] == ["a"]
+            @test [token.payload for token in branch_results[1].final_marking.tokens_by_place[:right]] == ["b"]
+        end
+    end
+
+    @testset "fire: branched transitions reject unplaced vector outputs" begin
+        branch = branch_net()
         marking = Marking(Dict(:ready => Token[Token("r1")]))
         executor = FunctionExecutor((_, tokens) -> Token[
             Token(color(tokens[1]), run_key(tokens[1]), "a"),
@@ -660,15 +772,59 @@ passthrough(tid, tokens) = Token(color(tokens[1]), run_key(tokens[1]), (item=ite
         ])
         with_executor(:default, executor) do
             branch_results = fire(branch, marking; max_concurrency=1)
-            weighted_results = fire(weighted, marking; max_concurrency=1)
             @test branch_results[1].status === :failed
             @test branch_results[1].terminal_reason === :executor_failed
-            @test occursin("exactly one output arc", something(branch_results[1].error))
+            @test occursin("must be keyed by destination place", something(branch_results[1].error))
             @test only(branch_results[1].final_marking.tokens_by_place[:ready]).run_key == "r1"
-            @test weighted_results[1].status === :failed
-            @test weighted_results[1].terminal_reason === :executor_failed
-            @test occursin("weight-1 output arc", something(weighted_results[1].error))
-            @test only(weighted_results[1].final_marking.tokens_by_place[:ready]).run_key == "r1"
+        end
+    end
+
+    @testset "fire: branched transitions reject malformed per-place outputs" begin
+        branch = branch_net()
+        marking = Marking(Dict(:ready => Token[Token("r1")]))
+
+        cases = [
+            (
+                "missing destination",
+                FunctionExecutor((_, tokens) -> Dict(
+                    :left => Token[Token(color(tokens[1]), run_key(tokens[1]), "a")],
+                )),
+                "must provide outputs for exactly",
+            ),
+            (
+                "extra destination",
+                FunctionExecutor((_, tokens) -> Dict(
+                    :left => Token[Token(color(tokens[1]), run_key(tokens[1]), "a")],
+                    :right => Token[Token(color(tokens[1]), run_key(tokens[1]), "b")],
+                    :ghost => Token[Token(color(tokens[1]), run_key(tokens[1]), "c")],
+                )),
+                "unknown output place",
+            ),
+            (
+                "non-symbol key",
+                FunctionExecutor((_, tokens) -> Dict{Any,Any}(
+                    "left" => Token[Token(color(tokens[1]), run_key(tokens[1]), "a")],
+                    :right => Token[Token(color(tokens[1]), run_key(tokens[1]), "b")],
+                )),
+                "keys must be destination place Symbols",
+            ),
+            (
+                "nothing output",
+                FunctionExecutor((_, _) -> nothing),
+                "returned nothing",
+            ),
+        ]
+
+        for (label, executor, needle) in cases
+            with_executor(:default, executor) do
+                results = fire(branch, marking; max_concurrency=1)
+                @testset "$label" begin
+                    @test results[1].status === :failed
+                    @test results[1].terminal_reason === :executor_failed
+                    @test occursin(needle, something(results[1].error))
+                    @test only(results[1].final_marking.tokens_by_place[:ready]).run_key == "r1"
+                end
+            end
         end
     end
 
@@ -693,6 +849,47 @@ passthrough(tid, tokens) = Token(color(tokens[1]), run_key(tokens[1]), (item=ite
         end
     end
 
+    @testset "fire: commit-phase failures do not block sibling bundles in the same run" begin
+        net = Net(
+            Dict(
+                :bad_ready => Place(:bad_ready),
+                :good_ready => Place(:good_ready),
+                :done_full => Place(:done_full, 1),
+                :done_ok => Place(:done_ok),
+            ),
+            Dict(
+                :a_bad => Transition(:a_bad),
+                :z_good => Transition(:z_good),
+            ),
+            [
+                ArcFrom(:a_bad, :bad_ready),
+                ArcFrom(:z_good, :good_ready),
+            ],
+            [
+                ArcTo(:a_bad, :done_full),
+                ArcTo(:z_good, :done_ok),
+            ],
+        )
+        marking = Marking(Dict(
+            :bad_ready => Token[Token(:bad_ready, "r1", (label=:bad,))],
+            :good_ready => Token[Token(:good_ready, "r1", (label=:good,))],
+            :done_full => Token[Token(:done_full, "occupied", (full=true,))],
+        ))
+        executor = FunctionExecutor((tid, tokens) -> begin
+            tid === :a_bad && return Token(:done_full, run_key(tokens[1]), (label=:bad,))
+            return Token(:done_ok, run_key(tokens[1]), (label=:good,))
+        end)
+        with_executor(:default, executor) do
+            result = only([item for item in fire(net, marking; max_concurrency=1) if item.run_key == "r1"])
+            @test result.status === :failed
+            @test result.terminal_reason === :executor_failed
+            @test [step.bundle.transition_id for step in result.trace] == [:a_bad, :z_good]
+            @test [step.status for step in result.trace] == [:failed, :completed]
+            @test only(result.final_marking.tokens_by_place[:bad_ready]).payload.label === :bad
+            @test only(result.final_marking.tokens_by_place[:done_ok]).payload.label === :good
+        end
+    end
+
     @testset "fire: rubric pipeline joins per item regardless of rubric arrival order" begin
         net = rubric_pipeline_net()
         marking = Marking(Dict(:seed => Token[
@@ -704,7 +901,11 @@ passthrough(tid, tokens) = Token(color(tokens[1]), run_key(tokens[1]), (item=ite
         delays = Dict(item => 0.01 + 0.01 * rand(rng) for item in [:a, :b, :c])
         executor = FunctionExecutor((tid, tokens) -> begin
             if tid === :tee
-                return Token(:seed, run_key(tokens[1]), (item=item_id(tokens[1]),))
+                item = item_id(tokens[1])
+                return Dict(
+                    :problem => Token[Token(:seed, run_key(tokens[1]), (item=item,))],
+                    :rubric_seed => Token[Token(:seed, run_key(tokens[1]), (item=item,))],
+                )
             elseif tid === :make_rubric
                 sleep(delays[item_id(tokens[1])])
                 return Token(:rubric, run_key(tokens[1]), (item=item_id(tokens[1]), rubric=true))
@@ -729,7 +930,11 @@ passthrough(tid, tokens) = Token(color(tokens[1]), run_key(tokens[1]), (item=ite
         ]))
         executor = FunctionExecutor((tid, tokens) -> begin
             if tid === :tee
-                return Token(:seed, run_key(tokens[1]), (item=item_id(tokens[1]),))
+                item = item_id(tokens[1])
+                return Dict(
+                    :problem => Token[Token(:seed, run_key(tokens[1]), (item=item,))],
+                    :rubric_seed => Token[Token(:seed, run_key(tokens[1]), (item=item,))],
+                )
             elseif tid === :make_rubric
                 item_id(tokens[1]) == :b && error("rubric boom")
                 return Token(:rubric, run_key(tokens[1]), (item=item_id(tokens[1]), rubric=true))
@@ -892,6 +1097,35 @@ passthrough(tid, tokens) = Token(color(tokens[1]), run_key(tokens[1]), (item=ite
             @test finished.result.terminal_reason === :executor_failed
             @test finished.result.terminal_bundle == results[1].terminal_bundle
         end
+    end
+
+    @testset "unregister_executor!" begin
+        name = :unregister_test
+        executor = FunctionExecutor(passthrough)
+        @test unregister_executor!(name) == false
+        register_executor!(name, executor)
+        @test unregister_executor!(name) == true
+        @test unregister_executor!(name) == false
+    end
+
+    @testset "fire: injected executors bypass the global registry" begin
+        net = chain_net()
+        marking = Marking(Dict(:ready => Token[batch_token(:ready, "r1", :a)]))
+
+        executors = Dict{Symbol,AbstractExecutor}(:default => FunctionExecutor(passthrough))
+        results = fire(net, marking; max_concurrency=1, executors=executors)
+        @test length(results) == 1
+        @test results[1].status === :completed
+    end
+
+    @testset "fire: missing injected executor surfaces as an executor failure" begin
+        net = chain_net()
+        marking = Marking(Dict(:ready => Token[batch_token(:ready, "r1", :a)]))
+        executors = Dict{Symbol,AbstractExecutor}()
+        results = fire(net, marking; max_concurrency=1, executors=executors)
+        @test length(results) == 1
+        @test results[1].status === :failed
+        @test results[1].terminal_reason === :executor_failed
     end
 end
 
