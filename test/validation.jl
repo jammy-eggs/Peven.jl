@@ -133,11 +133,36 @@ end
             Dict(:ready => Place(:ready, 1), :done => Place(:done, 1)),
             Dict(:judge => Transition(:judge)),
             [ArcFrom(:judge, :ready, 2)],
-            [ArcTo(:judge, :done, 2)],
+            [ArcTo(:judge, :done)],
         )
 
         issues = validate(net)
-        @test count(i -> i.code === :weight_exceeds_capacity, issues) == 2
+        @test count(i -> i.code === :weight_exceeds_capacity, issues) == 1
+    end
+
+    @testset "duplicate input arcs are aggregated before capacity validation" begin
+        net = Net(
+            Dict(:ready => Place(:ready, 1), :done => Place(:done, 1)),
+            Dict(:judge => Transition(:judge)),
+            [ArcFrom(:judge, :ready), ArcFrom(:judge, :ready)],
+            [ArcTo(:judge, :done)],
+        )
+
+        issues = validate(net)
+        @test count(i -> i.code === :weight_exceeds_capacity, issues) == 1
+        @test any(i -> i.code === :duplicate_input_arc && i.object_id === :judge, issues)
+    end
+
+    @testset "duplicate output arcs are reported by validate" begin
+        net = Net(
+            Dict(:ready => Place(:ready), :done => Place(:done)),
+            Dict(:judge => Transition(:judge)),
+            [ArcFrom(:judge, :ready)],
+            [ArcTo(:judge, :done), ArcTo(:judge, :done)],
+        )
+
+        issues = validate(net)
+        @test any(i -> i.code === :duplicate_output_arc && i.object_id === :judge, issues)
     end
 end
 

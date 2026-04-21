@@ -1,140 +1,28 @@
-"""
-    Check whether a transition's guard allows firing
-    Nothing guard always passes, Function guard is called with the bundle's input tokens
-"""
+# Shared runtime core
+
 @inline evaluate_guard(::Nothing, _) = true
 @inline evaluate_guard(guard::Function, tokens) = guard(tokens)
 
-"""
-    Drop a token into the output places of a fired transition
-    Copy-on-write: returns a new Marking, original is unchanged
-    Throws ArgumentError if any output place would exceed its capacity
-"""
-function drop(marking::Marking{T}, net::Net, tid::Symbol, token::T) where T<:AbstractToken
-    tokens = Dict{Symbol,Vector{T}}(k => copy(v) for (k, v) in marking.tokens_by_place)
-    for (pid, weight) in net.output_arcs[tid]
-        bucket = get!(()->T[], tokens, pid)
-        cap = net.places[pid].capacity
-        for _ in 1:weight
-            !isnothing(cap) && length(bucket) >= cap &&
-                throw(ArgumentError("capacity exceeded at :$pid"))
-            push!(bucket, token)
-        end
+@inline emit(::Nothing, _) = nothing
+@inline function emit(hook, event)
+    try
+        hook(event)
+    catch e
+        e isa InterruptException && rethrow()
+        nothing
     end
-    return Marking(tokens)
 end
 
-"""
-    Drop many tokens into a transition's sole output place
-    Copy-on-write: returns a new Marking, original is unchanged
-    Valid only for transitions with exactly one output arc of weight 1
-    Validates the full deposit before committing so capacity failures stay atomic
-"""
-function drop(
-    marking::Marking{T},
-    net::Net,
-    tid::Symbol,
-    outputs::AbstractVector{S},
-) where {T<:AbstractToken,S<:T}
-    isempty(outputs) && throw(ArgumentError("executor output vector must be non-empty"))
+@inline _seeded_run_keys(marking::Marking) = sort!(run_keys(marking))
 
-    arcs = get(net.output_arcs, tid, Tuple{Symbol,Int}[])
-    length(arcs) == 1 || throw(ArgumentError("executor output vector requires exactly one output arc"))
-    pid, weight = only(arcs)
-    weight == 1 || throw(ArgumentError("executor output vector requires a weight-1 output arc"))
-
-    bucket = get(marking.tokens_by_place, pid, T[])
-    cap = net.places[pid].capacity
-    !isnothing(cap) && length(bucket) + length(outputs) > cap &&
-        throw(ArgumentError("capacity exceeded at :$pid"))
-
-    tokens = Dict{Symbol,Vector{T}}(k => copy(v) for (k, v) in marking.tokens_by_place)
-    deposited = copy(bucket)
-    append!(deposited, outputs)
-    tokens[pid] = deposited
-    return Marking(tokens)
-end
-
-"""
-    Put grabbed tokens back after a failed firing when callers want restoration
-    Restores the marking to its pre-grab state
-    No capacity check needed because these tokens were already in these places
-"""
-function misfire(marking::Marking{T}, grabbed_by_place::Dict{Symbol,Vector{T}}) where T<:AbstractToken
-    restored = Dict{Symbol,Vector{T}}(k => copy(v) for (k, v) in marking.tokens_by_place)
-    for (pid, returned) in grabbed_by_place
-        append!(get!(()->T[], restored, pid), returned)
-    end
-    return Marking(restored)
-end
-
-"""
-    Collect the unique run_keys from the initial marking in lexicographic order
-    These are the fuses the engine will light
-"""
-function fuses(marking::Marking)
-    n = sum(length, values(marking.tokens_by_place); init=0)
-    seen = Set{String}()
-    sizehint!(seen, n)
-    ordered = String[]
-    sizehint!(ordered, n)
-    for tokens in values(marking.tokens_by_place)
-        for token in tokens
-            rk = run_key(token)
-            if rk ∉ seen
-                push!(seen, rk)
-                push!(ordered, rk)
-            end
-        end
-    end
-    sort!(ordered)
-    return ordered
-end
-
-"""
-    Check if a run_key's tokens have all left from-places (places with outgoing arcs)
-    Returns true when no tokens for this run_key remain in any from-place
-"""
 function run_completed(marking::Marking, rk::String, from_places::Set{Symbol})
     for (pid, tokens) in marking.tokens_by_place
         pid ∈ from_places || continue
-        any(t -> run_key(t) == rk, tokens) && return false
+        for token in tokens
+            run_key(token) == rk && return false
+        end
     end
     return true
-end
-
-"""
-    Extract the final marking snapshot for one run_key
-    Keeps only that run_key's tokens across all places and drops empty places
-"""
-function run_marking(marking::Marking{T}, rk::String) where T<:AbstractToken
-    filtered = Dict{Symbol,Vector{T}}()
-    sizehint!(filtered, length(marking.tokens_by_place))
-    for (pid, tokens) in marking.tokens_by_place
-        kept = T[]
-        for token in tokens
-            run_key(token) == rk && push!(kept, token)
-        end
-        isempty(kept) || (filtered[pid] = kept)
-    end
-    return Marking(filtered)
-end
-
-function _normalize_outputs(output, ::Type{T}) where T<:AbstractToken
-    if output isa T
-        return T[output]
-    end
-
-    output isa AbstractVector || throw(ArgumentError("executor output must be a token or vector of tokens"))
-    isempty(output) && throw(ArgumentError("executor output vector must be non-empty"))
-
-    outputs = T[]
-    sizehint!(outputs, length(output))
-    for token in output
-        token isa T || throw(ArgumentError("executor output vector must match the marking token type"))
-        push!(outputs, token)
-    end
-    return outputs
 end
 
 const _BundleTriple = Tuple{Symbol,String,Any}
@@ -150,78 +38,8 @@ struct _SelectionFailure
     error::String
 end
 
-struct _GuardErrorEpisode
-    message::String
-    first_seen_epoch::Int
-    first_seen_order::Int
-end
-
-struct _SelectionErrorEpisode
-    transition_id::Symbol
-    message::String
-end
-
-mutable struct _RunProgress{T<:AbstractToken}
-    trace::Vector{TransitionResult{T}}
-    active_guard_errors::Dict{Int,_GuardErrorEpisode}
-    selection_error::Union{Nothing,_SelectionErrorEpisode}
-    commit_blocked::Bool
-    fuse_blocked::Bool
-end
-
-mutable struct _PendingFiring{T<:AbstractToken}
-    bundle::BundleRef
-    admission_id::Int
-    firing_id::Int
-    attempt::Int
-    grabbed::Vector{T}
-    grabbed_by_place::Dict{Symbol,Vector{T}}
-end
-
-mutable struct _SchedulerState{T<:AbstractToken}
-    marking::Marking{T}
-    runs::Dict{String,_RunProgress{T}}
-    available::Dict{Int,BundleEnablement{T}}
-    available_triples::Dict{_BundleTriple,Vector{Int}}
-    ready::Vector{Int}
-    ready_set::Set{Int}
-    pending::Dict{Task,_PendingFiring{T}}
-    fired::Int
-    next_firing_id::Int
-    next_admission_id::Int
-    scan_epoch::Int
-end
-
-function _scheduler_state(marking::Marking{T}) where T<:AbstractToken
-    runs = Dict{String,_RunProgress{T}}()
-    for rk in fuses(marking)
-        runs[rk] = _RunProgress{T}(
-            TransitionResult{T}[],
-            Dict{Int,_GuardErrorEpisode}(),
-            nothing,
-            false,
-            false,
-        )
-    end
-    return _SchedulerState{T}(
-        marking,
-        runs,
-        Dict{Int,BundleEnablement{T}}(),
-        Dict{_BundleTriple,Vector{Int}}(),
-        Int[],
-        Set{Int}(),
-        Dict{Task,_PendingFiring{T}}(),
-        0,
-        1,
-        1,
-        0,
-    )
-end
-
-function _get_or_create_run_progress!(state::_SchedulerState{T}, rk::String) where T<:AbstractToken
-    return get!(state.runs, rk) do
-        _RunProgress{T}(TransitionResult{T}[], Dict{Int,_GuardErrorEpisode}(), nothing, false, false)
-    end
+struct _ClaimSelectionError <: Exception
+    failure::_SelectionFailure
 end
 
 @inline _bundle_triple(bundle::BundleRef) = (bundle.transition_id, bundle.run_key, bundle.selected_key)
@@ -237,39 +55,6 @@ end
 
 function _input_specs_for_bundle(net::Net, bundle::BundleRef)
     return _input_specs_for_transition(net, net.transitions[bundle.transition_id])
-end
-
-function _collect_run_buckets(marking::Marking{T}, pid::Symbol) where T<:AbstractToken
-    buckets = Dict{String,Vector{Tuple{Int,T}}}()
-    for (idx, token) in pairs(get(marking.tokens_by_place, pid, T[]))
-        push!(get!(()->Tuple{Int,T}[], buckets, run_key(token)), (idx, token))
-    end
-    return buckets
-end
-
-function _candidate_run_keys(input_specs::Vector{Tuple{Symbol,Int}}, by_place)
-    seen = Set{String}()
-    ordered = String[]
-    for (pid, _) in input_specs
-        for rk in keys(get(by_place, pid, Dict{String,Vector}()))
-            rk ∈ seen && continue
-            push!(seen, rk)
-            push!(ordered, rk)
-        end
-    end
-    sort!(ordered)
-end
-
-function _normalize_check(net::Net, check::Union{Nothing,Vector{Symbol}})
-    if check === nothing
-        return sort!(collect(keys(net.transitions)))
-    end
-
-    live = sort!(collect(Set(check)))
-    for tid in live
-        haskey(net.transitions, tid) || throw(ArgumentError("unknown transition in check: :$tid"))
-    end
-    return live
 end
 
 function _safe_showerror(err)
@@ -295,13 +80,28 @@ function _selector_key(
     return key
 end
 
-function _safe_put_completed!(completed::Channel{Task}, task::Task)
-    try
-        put!(completed, task)
-    catch e
-        e isa InvalidStateException || rethrow()
+
+# Enablement
+
+function _collect_run_buckets(marking::Marking{T}, pid::Symbol) where T<:AbstractToken
+    buckets = Dict{String,Vector{Tuple{Int,T}}}()
+    for (idx, token) in pairs(get(marking.tokens_by_place, pid, T[]))
+        push!(get!(()->Tuple{Int,T}[], buckets, run_key(token)), (idx, token))
     end
-    return nothing
+    return buckets
+end
+
+function _candidate_run_keys(input_specs::Vector{Tuple{Symbol,Int}}, by_place)
+    seen = Set{String}()
+    ordered = String[]
+    for (pid, _) in input_specs
+        for rk in keys(get(by_place, pid, Dict{String,Vector}()))
+            rk ∈ seen && continue
+            push!(seen, rk)
+            push!(ordered, rk)
+        end
+    end
+    sort!(ordered)
 end
 
 function _evaluate_bundle(
@@ -425,10 +225,18 @@ function _keyed_bundles_for_run(
     return bundles
 end
 
-"""
-    Internal bundle enumerator shared by enablement/hot/cold/fire
-    Returns bundle-level status grouped by `(transition, run_key, selected_key)`
-"""
+function _normalize_check(net::Net, check::Union{Nothing,Vector{Symbol}})
+    if check === nothing
+        return sort!(collect(keys(net.transitions)))
+    end
+
+    live = sort!(collect(Set(check)))
+    for tid in live
+        haskey(net.transitions, tid) || throw(ArgumentError("unknown transition in check: :$tid"))
+    end
+    return live
+end
+
 function _scan_enablement(
     net::Net,
     marking::Marking{T};
@@ -441,6 +249,7 @@ function _scan_enablement(
     scans = _TripleScan{T}[]
     selection_failures = _SelectionFailure[]
     live = _normalize_check(net, check)
+    bucket_cache = Dict{Symbol,Dict{String,Vector{Tuple{Int,T}}}}()
 
     for tid in live
         transition = net.transitions[tid]
@@ -448,7 +257,9 @@ function _scan_enablement(
         isempty(input_specs) && continue
         by_place = Dict{Symbol,Dict{String,Vector{Tuple{Int,T}}}}()
         for (pid, _) in input_specs
-            by_place[pid] = _collect_run_buckets(marking, pid)
+            by_place[pid] = get!(bucket_cache, pid) do
+                _collect_run_buckets(marking, pid)
+            end
         end
 
         for rk in _candidate_run_keys(input_specs, by_place)
@@ -492,9 +303,9 @@ function _scan_enablement(
 end
 
 """
-    Public bundle-level readiness view
-    `on_guard_error` receives `(bundle, exception)` for each errored bundle in this snapshot
-    Selector exceptions propagate to the caller
+    Bundle-level readiness view for the current marking.
+    `on_guard_error` receives `(bundle, exception)` for each guard error.
+    Selector exceptions propagate.
 """
 function enablement(
     net::Net,
@@ -522,7 +333,7 @@ function enablement(
 end
 
 """
-    Which bundles are hot — ready to fire from the current marking?
+    Bundles that are ready to fire from the current marking.
 """
 function hot(
     net::Net,
@@ -545,7 +356,7 @@ function hot(
 end
 
 """
-    Which transitions have no ready bundle — the inverse of hot()
+    Transitions with no ready bundle in the current marking.
 """
 function cold(
     net::Net,
@@ -567,45 +378,202 @@ function cold(
     return [tid for tid in scanned if tid ∉ ready]
 end
 
+
+# Firing and token movement
+
+const _NO_OUTPUT_PLACES = Symbol[]
+const _ReadyEntry = Tuple{Int,Int}
+
+@inline _output_places(net::Net, tid::Symbol) = get(net.output_arcs, tid, _NO_OUTPUT_PLACES)
+
+@inline function _has_output_place(places::Vector{Symbol}, pid::Symbol)
+    for place in places
+        place === pid && return true
+    end
+    return false
+end
+
+function _normalize_output_batch(output, ::Type{T}) where T<:AbstractToken
+    if output isa T
+        return T[output]
+    end
+
+    output isa AbstractVector || throw(ArgumentError("executor output must be a token or vector of tokens"))
+
+    outputs = T[]
+    sizehint!(outputs, length(output))
+    for token in output
+        token isa T || throw(ArgumentError("executor output vector must match the marking token type"))
+        push!(outputs, token)
+    end
+    return outputs
+end
+
+function _normalize_output_deposits(
+    net::Net,
+    tid::Symbol,
+    output,
+    ::Type{T},
+) where T<:AbstractToken
+    places = _output_places(net, tid)
+
+    if output === nothing
+        isempty(places) || throw(ArgumentError(
+            "executor returned nothing for transition :$tid, but output places are defined",
+        ))
+        return Dict{Symbol,Vector{T}}()
+    end
+
+    if output isa AbstractDict
+        expected_count = length(places)
+        deposits = Dict{Symbol,Vector{T}}()
+        sizehint!(deposits, expected_count)
+
+        for (pid, value) in pairs(output)
+            pid isa Symbol || throw(ArgumentError("executor output keys must be destination place Symbols"))
+            _has_output_place(places, pid) || throw(ArgumentError(
+                "executor output for transition :$tid references unknown output place :$pid",
+            ))
+            deposits[pid] = _normalize_output_batch(value, T)
+        end
+
+        length(deposits) == expected_count || throw(ArgumentError(
+            "executor output for transition :$tid must provide outputs for exactly $places",
+        ))
+        return deposits
+    end
+
+    outputs = _normalize_output_batch(output, T)
+    isempty(outputs) && throw(ArgumentError("executor output vector must be non-empty"))
+    length(places) == 1 || throw(ArgumentError(
+        "executor output for transition :$tid must be keyed by destination place when multiple output places are defined",
+    ))
+    return Dict(only(places) => outputs)
+end
+
+function _drop_outputs(
+    marking::Marking{T},
+    net::Net,
+    deposits::Dict{Symbol,Vector{T}},
+) where T<:AbstractToken
+    tokens = Dict{Symbol,Vector{T}}(k => copy(v) for (k, v) in marking.tokens_by_place)
+
+    for (pid, deposited) in deposits
+        bucket = get(marking.tokens_by_place, pid, nothing)
+        cap = net.places[pid].capacity
+        bucket_len = isnothing(bucket) ? 0 : length(bucket)
+        !isnothing(cap) && bucket_len + length(deposited) > cap &&
+            throw(ArgumentError("capacity exceeded at :$pid"))
+    end
+
+    for (pid, deposited) in deposits
+        append!(get!(()->T[], tokens, pid), deposited)
+    end
+
+    return Marking(tokens)
+end
+
+"""
+    Drop one output token through a transition's output arcs.
+    Returns a new marking and leaves the original unchanged.
+"""
+function drop(marking::Marking{T}, net::Net, tid::Symbol, token::T) where T<:AbstractToken
+    deposits = _normalize_output_deposits(net, tid, token, T)
+    return _drop_outputs(marking, net, deposits)
+end
+
+"""
+    Drop many output tokens through a transition's output arcs.
+    Returns a new marking and leaves the original unchanged.
+"""
+function drop(
+    marking::Marking{T},
+    net::Net,
+    tid::Symbol,
+    outputs::AbstractVector{S},
+) where {T<:AbstractToken,S<:T}
+    deposits = _normalize_output_deposits(net, tid, outputs, T)
+    return _drop_outputs(marking, net, deposits)
+end
+
+"""
+    Drop explicit per-place outputs through a transition's output arcs.
+    Returns a new marking and leaves the original unchanged.
+"""
+function drop(
+    marking::Marking{T},
+    net::Net,
+    tid::Symbol,
+    outputs_by_place::AbstractDict,
+) where T<:AbstractToken
+    deposits = _normalize_output_deposits(net, tid, outputs_by_place, T)
+    return _drop_outputs(marking, net, deposits)
+end
+
+"""
+    Restore grabbed tokens to their original places.
+"""
+function misfire(marking::Marking{T}, grabbed_by_place::Dict{Symbol,Vector{T}}) where T<:AbstractToken
+    restored = Dict{Symbol,Vector{T}}(k => copy(v) for (k, v) in marking.tokens_by_place)
+    for (pid, returned) in grabbed_by_place
+        append!(get!(()->T[], restored, pid), returned)
+    end
+    return Marking(restored)
+end
+
 function _claim_positions(marking::Marking{T}, net::Net, bundle::BundleRef) where T<:AbstractToken
     transition = net.transitions[bundle.transition_id]
     input_specs = _input_specs_for_bundle(net, bundle)
     claimed_positions = Dict{Symbol,Vector{Int}}()
     claimed_by_place = Dict{Symbol,Vector{T}}()
+    selector = transition.join_by
 
     for (pid, weight) in input_specs
         bucket = get(marking.tokens_by_place, pid, T[])
-        matched_positions = Int[]
-        matched_tokens = T[]
-        for (idx, token) in pairs(bucket)
-            run_key(token) == bundle.run_key || continue
-            if !isnothing(transition.join_by)
-                key = _selector_key(
-                    something(transition.join_by),
-                    bundle.transition_id,
-                    pid,
-                    bundle.run_key,
-                    token,
-                )
-                isequal(key, bundle.selected_key) || continue
-            end
-            push!(matched_positions, idx)
-            push!(matched_tokens, token)
-        end
-
         start = (bundle.ordinal - 1) * weight + 1
         stop = start + weight - 1
-        length(matched_positions) >= stop || return nothing
-        claimed_positions[pid] = collect(@view matched_positions[start:stop])
-        claimed_by_place[pid] = collect(@view matched_tokens[start:stop])
+        selected_positions = Int[]
+        selected_tokens = T[]
+        sizehint!(selected_positions, weight)
+        sizehint!(selected_tokens, weight)
+        matched = 0
+        for (idx, token) in pairs(bucket)
+            run_key(token) == bundle.run_key || continue
+            if !isnothing(selector)
+                key = try
+                    _selector_key(
+                        something(selector),
+                        bundle.transition_id,
+                        pid,
+                        bundle.run_key,
+                        token,
+                    )
+                catch e
+                    e isa InterruptException && rethrow()
+                    throw(_ClaimSelectionError(
+                        _SelectionFailure(bundle.transition_id, bundle.run_key, _safe_showerror(e)),
+                    ))
+                end
+                isequal(key, bundle.selected_key) || continue
+            end
+            matched += 1
+            matched < start && continue
+            push!(selected_positions, idx)
+            push!(selected_tokens, token)
+            matched == stop && break
+        end
+
+        matched >= stop || return nothing
+        claimed_positions[pid] = selected_positions
+        claimed_by_place[pid] = selected_tokens
     end
 
     return claimed_positions, claimed_by_place
 end
 
 """
-    Try to grab the exact bundle from the supplied marking snapshot
-    Returns `(new_marking, grabbed, grabbed_by_place)` or nothing if the bundle is stale/unavailable
+    Try to reserve the exact bundle from a marking snapshot.
+    Returns `(new_marking, grabbed, grabbed_by_place)` or `nothing`.
 """
 function grab(marking::Marking{T}, net::Net, bundle::BundleRef) where T<:AbstractToken
     claimed = _claim_positions(marking, net, bundle)
@@ -614,14 +582,19 @@ function grab(marking::Marking{T}, net::Net, bundle::BundleRef) where T<:Abstrac
 
     tokens = Dict{Symbol,Vector{T}}(k => copy(v) for (k, v) in marking.tokens_by_place)
     grabbed = T[]
+    sizehint!(grabbed, sum(length, values(grabbed_by_place)))
 
     for (pid, _) in _input_specs_for_bundle(net, bundle)
-        bucket = get(tokens, pid, T[])
-        claimed_set = Set(get(claimed_positions, pid, Int[]))
+        bucket = get(marking.tokens_by_place, pid, T[])
+        claimed = get(claimed_positions, pid, Int[])
         leftover = T[]
+        sizehint!(leftover, length(bucket) - length(claimed))
+        next_claim = 1
+        nclaimed = length(claimed)
         for (idx, token) in pairs(bucket)
-            if idx ∈ claimed_set
+            if next_claim <= nclaimed && idx == claimed[next_claim]
                 push!(grabbed, token)
+                next_claim += 1
             else
                 push!(leftover, token)
             end
@@ -633,12 +606,136 @@ function grab(marking::Marking{T}, net::Net, bundle::BundleRef) where T<:Abstrac
 end
 
 """
-    Grab the exact bundle or throw if it is stale/unavailable in the supplied marking
+    Reserve the exact bundle or throw if it is stale or unavailable.
 """
 function take(marking::Marking{T}, net::Net, bundle::BundleRef) where T<:AbstractToken
     result = grab(marking, net, bundle)
     isnothing(result) && throw(ArgumentError("stale or unavailable bundle"))
     return result
+end
+
+
+# Runtime scheduler
+
+struct _GuardErrorEpisode
+    message::String
+    first_seen_epoch::Int
+    first_seen_order::Int
+end
+
+struct _SelectionErrorEpisode
+    transition_id::Symbol
+    message::String
+end
+
+mutable struct _RunProgress{T<:AbstractToken}
+    trace::Vector{TransitionResult{T}}
+    active_guard_errors::Dict{Int,_GuardErrorEpisode}
+    selection_error::Union{Nothing,_SelectionErrorEpisode}
+    fuse_blocked::Bool
+end
+
+mutable struct _PendingFiring{T<:AbstractToken}
+    bundle::BundleRef
+    admission_id::Int
+    firing_id::Int
+    attempt::Int
+    grabbed::Vector{T}
+    grabbed_by_place::Dict{Symbol,Vector{T}}
+end
+
+mutable struct _SchedulerState{T<:AbstractToken}
+    marking::Marking{T}
+    runs::Dict{String,_RunProgress{T}}
+    blocked_bundles::Set{BundleRef}
+    available::Dict{Int,BundleEnablement{T}}
+    available_triples::Dict{_BundleTriple,Vector{Int}}
+    ready::Vector{_ReadyEntry}
+    ready_head::Int
+    ready_versions::Dict{Int,Int}
+    ready_set::Set{Int}
+    pending::Dict{Task,_PendingFiring{T}}
+    fired::Int
+    next_firing_id::Int
+    next_admission_id::Int
+    scan_epoch::Int
+
+    function _SchedulerState{T}(
+        marking::Marking{T},
+        runs::Dict{String,_RunProgress{T}},
+        blocked_bundles::Set{BundleRef},
+        available::Dict{Int,BundleEnablement{T}},
+        available_triples::Dict{_BundleTriple,Vector{Int}},
+        ready::Vector{_ReadyEntry},
+        ready_head::Int,
+        ready_versions::Dict{Int,Int},
+        ready_set::Set{Int},
+        pending::Dict{Task,_PendingFiring{T}},
+        fired::Int,
+        next_firing_id::Int,
+        next_admission_id::Int,
+        scan_epoch::Int,
+    ) where T<:AbstractToken
+        new(
+            marking,
+            runs,
+            blocked_bundles,
+            available,
+            available_triples,
+            ready,
+            ready_head,
+            ready_versions,
+            ready_set,
+            pending,
+            fired,
+            next_firing_id,
+            next_admission_id,
+            scan_epoch,
+        )
+    end
+end
+
+function _scheduler_state(marking::Marking{T}) where T<:AbstractToken
+    runs = Dict{String,_RunProgress{T}}()
+    for rk in _seeded_run_keys(marking)
+        runs[rk] = _RunProgress{T}(
+            TransitionResult{T}[],
+            Dict{Int,_GuardErrorEpisode}(),
+            nothing,
+            false,
+        )
+    end
+    return _SchedulerState{T}(
+        marking,
+        runs,
+        Set{BundleRef}(),
+        Dict{Int,BundleEnablement{T}}(),
+        Dict{_BundleTriple,Vector{Int}}(),
+        _ReadyEntry[],
+        1,
+        Dict{Int,Int}(),
+        Set{Int}(),
+        Dict{Task,_PendingFiring{T}}(),
+        0,
+        1,
+        1,
+        0,
+    )
+end
+
+function _get_or_create_run_progress!(state::_SchedulerState{T}, rk::String) where T<:AbstractToken
+    return get!(state.runs, rk) do
+        _RunProgress{T}(TransitionResult{T}[], Dict{Int,_GuardErrorEpisode}(), nothing, false)
+    end
+end
+
+function _safe_put_completed!(completed::Channel{Task}, task::Task)
+    try
+        put!(completed, task)
+    catch e
+        e isa InvalidStateException || rethrow()
+    end
+    return nothing
 end
 
 @inline _allocate_firing_id!(state::_SchedulerState) =
@@ -647,12 +744,27 @@ end
 @inline _allocate_admission_id!(state::_SchedulerState) =
     (admission_id = state.next_admission_id; state.next_admission_id += 1; admission_id)
 
-function _remove_ready_ids!(state::_SchedulerState, doomed::Set{Int})
-    isempty(doomed) && return nothing
-    filter!(state.ready) do id
-        keep = id ∉ doomed
-        keep || delete!(state.ready_set, id)
-        keep
+function _remove_ready_id!(state::_SchedulerState, doomed::Int)
+    doomed ∈ state.ready_set || return nothing
+    delete!(state.ready_set, doomed)
+    return nothing
+end
+
+@inline function _enqueue_ready!(state::_SchedulerState, id::Int)
+    version = get(state.ready_versions, id, 0) + 1
+    state.ready_versions[id] = version
+    push!(state.ready, (id, version))
+    push!(state.ready_set, id)
+    return nothing
+end
+
+function _maybe_compact_ready!(state::_SchedulerState)
+    if state.ready_head > length(state.ready)
+        empty!(state.ready)
+        state.ready_head = 1
+    elseif state.ready_head > 32 && state.ready_head * 2 > length(state.ready)
+        state.ready = state.ready[state.ready_head:end]
+        state.ready_head = 1
     end
     return nothing
 end
@@ -671,9 +783,8 @@ function _drop_available_id!(state::_SchedulerState{T}, id::Int) where T<:Abstra
         isempty(ids) && delete!(state.available_triples, triple)
     end
 
-    if id ∈ state.ready_set
-        _remove_ready_ids!(state, Set([id]))
-    end
+    _remove_ready_id!(state, id)
+    delete!(state.ready_versions, id)
     delete!(state.available, id)
     return nothing
 end
@@ -696,11 +807,10 @@ function _set_ready_membership!(
 )
     if should_be_ready
         if id ∉ state.ready_set
-            push!(state.ready, id)
-            push!(state.ready_set, id)
+            _enqueue_ready!(state, id)
         end
     elseif id ∈ state.ready_set
-        _remove_ready_ids!(state, Set([id]))
+        _remove_ready_id!(state, id)
     end
     return nothing
 end
@@ -743,7 +853,7 @@ end
 function _blocked_run_keys(state::_SchedulerState)
     blocked = Set{String}()
     for (rk, run) in state.runs
-        (!isnothing(run.selection_error) || run.commit_blocked) && push!(blocked, rk)
+        !isnothing(run.selection_error) && push!(blocked, rk)
     end
     return blocked
 end
@@ -759,23 +869,7 @@ function _block_run_for_selection!(
     run.selection_error = _SelectionErrorEpisode(failure.transition_id, failure.error)
     empty!(run.active_guard_errors)
     emit(on_event, SelectionErrored(failure.transition_id, failure.run_key, failure.error))
-
-    doomed = Set{Int}()
-    for (id, record) in state.available
-        record.bundle.run_key == failure.run_key && push!(doomed, id)
-    end
-    for id in doomed
-        _drop_available_id!(state, id)
-    end
-    return nothing
-end
-
-function _block_run_for_commit_failure!(state::_SchedulerState{T}, rk::String) where T<:AbstractToken
-    run = _get_or_create_run_progress!(state, rk)
-    run.commit_blocked && return nothing
-    run.commit_blocked = true
-    empty!(run.active_guard_errors)
-    _drop_available_for_run!(state, rk)
+    _drop_available_for_run!(state, failure.run_key)
     return nothing
 end
 
@@ -790,7 +884,7 @@ function _refresh_enablement!(
         net,
         state.marking;
         failed=_blocked_run_keys(state),
-        in_flight=Set{BundleRef}(),
+        in_flight=state.blocked_bundles,
         check=check,
         swallow_selection_errors=true,
     )
@@ -875,14 +969,19 @@ function _refresh_enablement!(
 end
 
 function _pop_ready!(state::_SchedulerState)
-    while !isempty(state.ready)
-        id = popfirst!(state.ready)
+    while state.ready_head <= length(state.ready)
+        id, version = state.ready[state.ready_head]
+        state.ready_head += 1
+        id ∈ state.ready_set || continue
+        version == get(state.ready_versions, id, 0) || continue
         delete!(state.ready_set, id)
         record = get(state.available, id, nothing)
         isnothing(record) && continue
         record.status === :ready || continue
+        _maybe_compact_ready!(state)
         return id
     end
+    _maybe_compact_ready!(state)
     return nothing
 end
 
@@ -927,7 +1026,16 @@ function _launch_ready_bundle!(
     run_executor,
     on_event,
 ) where T<:AbstractToken
-    result = grab(state.marking, net, record.bundle)
+    result = try
+        grab(state.marking, net, record.bundle)
+    catch e
+        if e isa _ClaimSelectionError
+            _block_run_for_selection!(state, e.failure; on_event=on_event)
+            _refresh_enablement!(state, net, net.recheck[record.bundle.transition_id]; on_event=on_event)
+            return false
+        end
+        rethrow()
+    end
     if isnothing(result)
         _drop_available_id!(state, admission_id)
         return false
@@ -978,11 +1086,13 @@ function _launch_ready!(
 end
 
 function _ensure_known_output_run_keys!(state::_SchedulerState, outputs)
-    for token in outputs
-        rk = run_key(token)
-        haskey(state.runs, rk) || throw(ArgumentError(
-            "executor emitted token with unknown run_key=$rk; outputs must stay within the initial run set",
-        ))
+    for deposited in values(outputs)
+        for token in deposited
+            rk = run_key(token)
+            haskey(state.runs, rk) || throw(ArgumentError(
+                "executor emitted token with unknown run_key=$rk; outputs must stay within the initial run set",
+            ))
+        end
     end
     return nothing
 end
@@ -993,12 +1103,10 @@ function _commit_firing_outputs!(
     firing::_PendingFiring{T},
     output,
 ) where T<:AbstractToken
-    outputs = _normalize_outputs(output, T)
-    _ensure_known_output_run_keys!(state, outputs)
-    state.marking = output isa AbstractVector ?
-        drop(state.marking, net, firing.bundle.transition_id, outputs) :
-        drop(state.marking, net, firing.bundle.transition_id, only(outputs))
-    return outputs
+    deposits = _normalize_output_deposits(net, firing.bundle.transition_id, output, T)
+    _ensure_known_output_run_keys!(state, deposits)
+    state.marking = _drop_outputs(state.marking, net, deposits)
+    return deposits
 end
 
 function _retry_firing!(
@@ -1047,7 +1155,7 @@ function _close_failed_firing!(
         firing.bundle,
         firing.firing_id,
         status,
-        T[],
+        Dict{Symbol,Vector{T}}(),
         msg,
         firing.attempt,
     ))
@@ -1063,7 +1171,7 @@ function _close_failed_firing!(
         state.marking = misfire(state.marking, firing.grabbed_by_place)
     end
     if restore_inputs && status === :failed
-        _block_run_for_commit_failure!(state, firing.bundle.run_key)
+        push!(state.blocked_bundles, firing.bundle)
     end
     if status === :fuse_blocked
         run.fuse_blocked = true
@@ -1200,10 +1308,15 @@ function _earliest_guard_error(state::_SchedulerState{T}, run::_RunProgress{T}) 
     return state.available[admission_id].bundle, episode.message
 end
 
-function _earliest_failed_firing(run::_RunProgress)
-    failed = [step for step in run.trace if step.status === :failed]
-    isempty(failed) && return nothing
-    return first(sort!(failed; by=step -> step.firing_id))
+function _earliest_failed_firing(run::_RunProgress{T}) where T<:AbstractToken
+    earliest = nothing
+    for step in run.trace
+        step.status === :failed || continue
+        if isnothing(earliest) || step.firing_id < earliest.firing_id
+            earliest = step
+        end
+    end
+    return earliest
 end
 
 function _finalize_results(
@@ -1214,6 +1327,7 @@ function _finalize_results(
     on_event = nothing,
 ) where T<:AbstractToken
     results = RunResult{T}[]
+    sizehint!(results, length(seeded))
     for rk in seeded
         run = _get_or_create_run_progress!(state, rk)
         terminal_bundle = nothing
@@ -1268,13 +1382,9 @@ function _finalize_results(
 end
 
 """
-    Run the engine to completion
-    fuse limits total transition launches before stopping, including retries
-    Once fuse is exhausted the engine launches no new firings, but lets in-flight work drain
-    max_concurrency caps how many transitions run in parallel
-    RunResult.terminal_reason is one of
-      :selection_error, :executor_failed, :guard_error, :fuse_exhausted, :no_enabled_transition
-    on_event receives EngineEvent instances as they happen
+    Run the engine to completion.
+    `fuse` limits total launches, including retries.
+    `max_concurrency` caps concurrently executing transitions.
 """
 function fire(
     net::Net,
@@ -1282,15 +1392,14 @@ function fire(
     fuse::Int = 1000,
     max_concurrency::Int = 10,
     on_event = nothing,
+    executors::Union{Nothing,AbstractDict{Symbol,<:AbstractExecutor}} = nothing,
 ) where T<:AbstractToken
     max_concurrency >= 1 || throw(ArgumentError("max_concurrency must be at least 1"))
     fuse >= 0 || throw(ArgumentError("fuse must be at least 0"))
 
-    seeded = fuses(marking)
+    seeded = _seeded_run_keys(marking)
     if isempty(seeded)
-        issues = new_issues(net, marking)
-        validate!(issues, net)
-        validate_marking!(issues, marking, net)
+        issues = validate_fire_inputs(net, marking)
         isempty(issues) || throw(ArgumentError("invalid net/marking: $(issues[1].message)"))
         return RunResult{T}[]
     end
@@ -1301,7 +1410,7 @@ function fire(
     state = _scheduler_state(marking)
 
     run_executor(tid::Symbol, tokens::Vector{T}) =
-        execute(get_executor(net.transitions[tid].executor), tid, tokens)
+        execute(resolve_executor(net.transitions[tid].executor, executors), tid, tokens)
 
     completed = Channel{Task}(max_concurrency)
     interrupted = false

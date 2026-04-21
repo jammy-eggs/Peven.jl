@@ -66,13 +66,7 @@ using Main.Peven
         arc = ArcTo(:judge, :done)
         @test arc.transition === :judge
         @test arc.to === :done
-        @test arc.weight == 1
-
-        weighted = ArcTo(:judge, :done, 2)
-        @test weighted.weight == 2
-
-        @test_throws ArgumentError ArcTo(:judge, :done, 0)
-        @test_throws ArgumentError ArcTo(:judge, :done, -1)
+        @test !hasmethod(ArcTo, Tuple{Symbol,Symbol,Int})
     end
 
     @testset "Net" begin
@@ -105,8 +99,8 @@ using Main.Peven
 
         @test net.input_arcs[:t1] == [(:b, 2), (:a, 1)]
         @test isempty(net.input_arcs[:t2])
-        @test net.output_arcs[:t1] == [(:c, 1)]
-        @test net.output_arcs[:t2] == [(:c, 1)]
+        @test net.output_arcs[:t1] == [:c]
+        @test net.output_arcs[:t2] == [:c]
     end
 
     @testset "Net allows structural validation to happen later" begin
@@ -137,6 +131,7 @@ using Main.Peven
         )
         @test net.input_arcs[:join] == [(:left, 1), (:right, 1)]
     end
+
 end
 
 end

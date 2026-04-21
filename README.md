@@ -80,7 +80,7 @@ results = fire(net, marking; max_concurrency=1)
 
 ## Core Patterns
 
-- **`tee`** -- the canonical one-to-many fan-out idiom. One transition with multiple output arcs duplicates the executor's single returned token into several Places.
+- **`tee`** -- the canonical one-to-many fork idiom. One transition with multiple output arcs emits explicit per-place outputs so downstream branches can consume distinct tokens eagerly.
 - **Self-loop** -- a transition deposits back into one of its input Places, which is how Peven expresses retry loops and iterative refinement cycles.
 - **Keyed join** -- `Transition(...; join_by=(place_id, token) -> key)` correlates multi-place inputs within a single `run_key`, so one batch can contain many independently joined items.
 
@@ -90,7 +90,7 @@ For keyed pipelines, the default schema is: one `run_key` per batch, one `join_b
 
 This is the canonical eval shape for `tee` plus keyed join:
 
-- `:tee` duplicates each problem token into `:problem` and `:rubric_seed`
+- `:tee` emits one token to `:problem` and one token to `:rubric_seed`
 - `:make_rubric` turns `:rubric_seed` into `:rubric`
 - `:judge` consumes from `:problem` and `:rubric` with `join_by=(pid, token) -> token.payload.problem_id`
 
@@ -100,15 +100,17 @@ That keeps problem/rubric pairing correct even when rubric generation completes 
 
 | Function | What it does |
 |---|---|
-| `fuses(marking)` | Collect unique run_keys from the initial marking |
+| `run_keys(marking)` | Collect the distinct `run_key`s present in a marking |
+| `run_marking(marking, run_key)` | Slice a marking down to one `run_key` |
 | `enablement(net, marking)` | Return bundle-level readiness records with `bundle`, `status`, `inputs`, and `error` |
 | `hot(net, marking)` | Which concrete `BundleRef`s are ready to fire |
 | `cold(net, marking)` | Which transitions have no ready bundle — the inverse of `hot` |
 | `grab(marking, net, bundle)` | Return `(new_marking, grabbed, grabbed_by_place)` or `nothing` if that bundle is stale/unavailable |
 | `take(marking, net, bundle)` | Same as `grab`, but throws `ArgumentError("stale or unavailable bundle")` |
 | `fire(net, marking; ...)` | Run the engine to completion and return `Vector{RunResult}` |
-| `drop(marking, net, tid, token)` | Deposit output token into output places |
-| `drop(marking, net, tid, outputs)` | Deposit many output tokens into one output place |
+| `drop(marking, net, tid, token)` | Deposit one output token for a single-output transition |
+| `drop(marking, net, tid, outputs)` | Deposit many output tokens for a single-output transition |
+| `drop(marking, net, tid, outputs_by_place)` | Deposit explicit per-place outputs for a multi-output transition |
 | `misfire(marking, consumed)` | Return consumed tokens after executor failure |
 | `completed_firings(result)` | Project completed `TransitionResult` rows from a `RunResult` |
 | `failed_firings(result)` | Project ordinary failed `TransitionResult` rows from a `RunResult` |
@@ -122,7 +124,7 @@ That keeps problem/rubric pairing correct even when rubric generation completes 
 - `take(...)` throws
 
 Peven keeps scheduler identity internally with admission ids, but the public `BundleRef.ordinal` is intentionally only meaningful for the snapshot that produced it. For durable post-launch inspection, use `firing_id`, not `BundleRef`.
-`fuses(marking)` and the returned `RunResult`s are ordered lexicographically by `run_key`.
+`run_keys(marking)` preserves first-seen order. `fire(...)` returns `RunResult`s ordered lexicographically by `run_key`.
 
 ## Performance
 
@@ -132,7 +134,10 @@ Peven uses precomputed per-transition influence sets (LoLA 2's incremental enabl
 
 Transitions look up executors by their `executor::Symbol` in a process-global registry.
 For custom executors, subtype `AbstractExecutor`, extend `Peven.execute`, and register an instance with `register_executor!`.
-Executors may return one token or a vector of tokens. Vector outputs are valid only for transitions with exactly one output arc of weight `1`.
+The registry itself is private. Use `unregister_executor!` for cleanup, or pass `fire(...; executors=Dict(...))` to inject executors without touching global registry state.
+Executors for single-output transitions may return one token or a vector of tokens.
+Executors for multi-output transitions must return outputs keyed by destination place, for example `Dict(:left => Token[t1], :right => Token[t2])`.
+Tokens are linear: if two downstream branches need the same data, the executor must emit two distinct tokens, even if they share payload.
 Executors and guards still receive `Vector{T}` inputs. Under keyed joins that vector is now the selected bundle.
 Executors must keep outputs inside the initial `run_key` set for v0.4. Emitting a token with a new `run_key` is treated as a launched-firing failure.
 `fire` treats retries as new launches for fuse accounting, and event / trace records expose `bundle`, `firing_id`, plus `attempt` metadata for each launched firing.
@@ -141,7 +146,7 @@ Executors must keep outputs inside the initial `run_key` set for v0.4. Emitting 
 
 `TransitionStarted`, `TransitionCompleted`, and `TransitionFailed` are emitted through `on_event` for launched firings only, and each now carries a `bundle::BundleRef`.
 Guard exceptions emit `GuardErrored(bundle, error)`. Selector exceptions emit `SelectionErrored(transition_id, run_key, error)`.
-Completed events and `TransitionResult`s carry `outputs::Vector{T}` so scalar and vector executor returns share one shape.
+Completed events and `TransitionResult`s carry committed outputs keyed by destination place.
 Each launched firing has a stable `firing_id`, and retries increment `attempt` while keeping that same `firing_id`.
 `TransitionResult.trace` contains launched firings only; guard and selection observations do not allocate firing ids or create fake trace rows. Each trace row is one terminal lifecycle row per launched `firing_id`, with `status === :completed`, `:failed`, or `:fuse_blocked`.
 
@@ -150,7 +155,7 @@ Each launched firing has a stable `firing_id`, and retries increment `attempt` w
 
 ## Validation
 
-`validate(net)` checks structural integrity: key consistency, place endpoint references, orphan places, keyed-join structure, duplicate input arcs, and arc weights that exceed bounded place capacity.
+`validate(net)` checks structural integrity: key consistency, place endpoint references, orphan places, keyed-join structure, duplicate input arcs, duplicate output arcs, and input arc weights that exceed bounded place capacity.
 `validate(net, marking)` adds marking checks (unknown places, capacity) and reachability (dead transitions).
 
 Structural keyed-join issues are reported by `validate(...)`; `Net(...)` construction keeps only local field invariants.
@@ -159,7 +164,8 @@ v0.4 validation rules include:
 
 - `join_by` is valid only on transitions with at least two unique input Places
 - duplicate input arcs for the same `(transition, place)` are rejected; use `weight` instead
-- input or output arc weights may not exceed the capacity of a bounded connected Place
+- duplicate output arcs for the same `(transition, place)` are rejected; use one output arc per destination place
+- input arc weights may not exceed the capacity of a bounded connected Place
 - `ArcFrom` declaration order is no longer semantic for joins; bundle ordering is canonicalized by Place id and token order
 
 ```julia

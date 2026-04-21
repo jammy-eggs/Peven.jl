@@ -1,36 +1,49 @@
 """
-    Executors run the actual work for a Transition (LLM call, tool, judge)
-    Subtype AbstractExecutor and extend Peven.execute(executor, tid, tokens) to use your own.
-    Executors may return one token or a vector of tokens.
+    Base type for transition executors.
+    Extend `execute(executor, tid, tokens)` for custom executors.
 """
 abstract type AbstractExecutor end
 
 execute(e::AbstractExecutor, tid::Symbol, tokens::Vector{<:AbstractToken}) =
     error("implement execute(::$(typeof(e)), ...)")
 
-const EXECUTOR_REGISTRY = Dict{Symbol, AbstractExecutor}()
+function register_executor! end
+function unregister_executor! end
+function resolve_executor end
 
 """
-    Register an executor under a name so Transitions can reference it
-    register_executor!(:agent, MyAgentExecutor()) makes Transition(:gen, :agent) use it
-    The registry is process-global, so tests and applications should clean up names they reuse
-"""
-register_executor!(name::Symbol, executor::AbstractExecutor) =
-    (EXECUTOR_REGISTRY[name] = executor; nothing)
-
-"""
-    Look up a registered executor by name, throws KeyError if not found
-"""
-function get_executor(name::Symbol)
-    haskey(EXECUTOR_REGISTRY, name) || throw(KeyError("no executor registered for :$name"))
-    return EXECUTOR_REGISTRY[name]
-end
-
-"""
-    Wraps any (tid, tokens) -> token callable as an executor
-    Useful for tests and simple inline executors without defining a struct
+    Wrap a `(tid, tokens) -> token_or_tokens` callable as an executor.
 """
 struct FunctionExecutor <: AbstractExecutor
     fn::Function
 end
 execute(e::FunctionExecutor, tid::Symbol, tokens::Vector{<:AbstractToken}) = e.fn(tid, tokens)
+
+let registry = Dict{Symbol,AbstractExecutor}()
+    """
+        Register an executor under a name.
+        The registry is process-global, so callers should clean up reused names.
+    """
+    global function register_executor!(name::Symbol, executor::AbstractExecutor)
+        registry[name] = executor
+        return nothing
+    end
+
+    """
+        Remove a registered executor by name.
+    """
+    global unregister_executor!(name::Symbol) = !isnothing(pop!(registry, name, nothing))
+
+    global function resolve_executor(name::Symbol, ::Nothing)
+        haskey(registry, name) || throw(KeyError("no executor registered for :$name"))
+        return registry[name]
+    end
+
+    global function resolve_executor(
+        name::Symbol,
+        executors::AbstractDict{Symbol,E},
+    ) where {E<:AbstractExecutor}
+        haskey(executors, name) || throw(KeyError("no executor provided for :$name"))
+        return executors[name]
+    end
+end
