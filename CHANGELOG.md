@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.4.3
+
+- Expose grouped transition inputs through `ExecutionContext.inputs_by_place` for executors, adapters, and callback layers
+- Expose grouped transition inputs through `TransitionStarted.inputs_by_place` for sinks, traces, and observability tooling
+- Preserve existing executor compatibility by keeping `execute(executor, ctx)` fallback semantics on `ctx.tokens`
+
 ## v0.4.2
 
 - Add public `ExecutionContext` for adapter and custom executor integrations
