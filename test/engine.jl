@@ -93,6 +93,15 @@ function with_executor(f, name::Symbol, executor)
     end
 end
 
+mutable struct RecordingExecutor <: AbstractExecutor
+    contexts::Vector{Any}
+end
+
+Peven.execute(executor::RecordingExecutor, ctx::ExecutionContext) = begin
+    push!(executor.contexts, ctx)
+    passthrough(ctx.transition_id, ctx.tokens)
+end
+
 passthrough(tid, tokens) = Token(color(tokens[1]), run_key(tokens[1]), (item=item_id(tokens[1]), transition=tid))
 
 queued_ready_ids(state) = Int[
@@ -339,6 +348,28 @@ queued_ready_ids(state) = Int[
             @test started.firing_id == completed.firing_id == results[1].trace[1].firing_id
             @test collect(keys(completed.outputs)) == [:done]
             @test completed.outputs == results[1].trace[1].outputs
+        end
+    end
+
+    @testset "fire: public ExecutionContext carries firing metadata" begin
+        net = chain_net()
+        marking = Marking(Dict(:ready => Token[batch_token(:ready, "r1", :a, "work")]))
+        events = EngineEvent[]
+        executor = RecordingExecutor(Any[])
+        with_executor(:default, executor) do
+            results = fire(net, marking; max_concurrency=1, on_event=e -> push!(events, e))
+            started = only([e for e in events if e isa TransitionStarted])
+            step = only(results[1].trace)
+            ctx = only(executor.contexts)
+
+            @test ctx.transition_id === :judge
+            @test ctx.bundle == BundleRef(:judge, "r1", nothing, 1)
+            @test ctx.bundle == started.bundle == step.bundle
+            @test ctx.firing_id == started.firing_id == step.firing_id
+            @test ctx.attempt == started.attempt == 1
+            @test ctx.tokens === started.inputs
+            @test length(ctx.tokens) == 1
+            @test ctx.tokens[1].payload.payload == "work"
         end
     end
 
@@ -984,6 +1015,28 @@ queued_ready_ids(state) = Int[
             @test results[1].status === :completed
             @test length(results[1].trace) == 1
         end
+    end
+
+    @testset "fire: on_event_error=:throw rethrows hook failures" begin
+        net = chain_net()
+        marking = Marking(Dict(:ready => Token[batch_token(:ready, "r1", :a)]))
+        hook(event) = event isa TransitionStarted ? error("hook boom") : nothing
+        with_executor(:default, FunctionExecutor(passthrough)) do
+            err = try
+                fire(net, marking; max_concurrency=1, on_event=hook, on_event_error=:throw)
+                nothing
+            catch e
+                e
+            end
+            @test err isa ErrorException
+            @test err.msg == "hook boom"
+        end
+    end
+
+    @testset "fire: invalid on_event_error throws" begin
+        net = chain_net()
+        marking = Marking(Dict(:ready => Token[batch_token(:ready, "r1", :a)]))
+        @test_throws ArgumentError fire(net, marking; max_concurrency=1, on_event_error=:boom)
     end
 
     @testset "fire: interrupts do not wait for pending executors in finally" begin

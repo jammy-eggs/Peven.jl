@@ -4,13 +4,31 @@
 @inline evaluate_guard(guard::Function, tokens) = guard(tokens)
 
 @inline emit(::Nothing, _) = nothing
-@inline function emit(hook, event)
+@inline emit(hook, event) = hook(event)
+
+struct _BestEffortEventHook{F}
+    hook::F
+end
+
+@inline function (wrapped::_BestEffortEventHook)(event)
     try
-        hook(event)
+        wrapped.hook(event)
     catch e
         e isa InterruptException && rethrow()
         nothing
     end
+end
+
+@inline function _validate_on_event_error(on_event_error::Symbol)
+    on_event_error === :ignore && return on_event_error
+    on_event_error === :throw && return on_event_error
+    throw(ArgumentError("on_event_error must be :ignore or :throw"))
+end
+
+@inline _normalize_event_hook(::Nothing, ::Symbol) = nothing
+@inline function _normalize_event_hook(hook, on_event_error::Symbol)
+    on_event_error === :ignore && return _BestEffortEventHook(hook)
+    return hook
 end
 
 @inline _seeded_run_keys(marking::Marking) = sort!(run_keys(marking))
@@ -991,10 +1009,17 @@ function _spawn_execution_task(
     run_executor,
 ) where T<:AbstractToken
     inputs = copy(firing.grabbed)
+    context = ExecutionContext(
+        firing.bundle.transition_id,
+        firing.bundle,
+        firing.firing_id,
+        firing.attempt,
+        inputs,
+    )
     task = Threads.@spawn begin
         local result
         try
-            result = run_executor(firing.bundle.transition_id, inputs)
+            result = run_executor(context)
         catch
             _safe_put_completed!(completed, current_task())
             rethrow()
@@ -1385,6 +1410,7 @@ end
     Run the engine to completion.
     `fuse` limits total launches, including retries.
     `max_concurrency` caps concurrently executing transitions.
+    `on_event_error=:ignore` swallows ordinary hook exceptions; `:throw` rethrows them.
 """
 function fire(
     net::Net,
@@ -1392,10 +1418,13 @@ function fire(
     fuse::Int = 1000,
     max_concurrency::Int = 10,
     on_event = nothing,
+    on_event_error::Symbol = :ignore,
     executors::Union{Nothing,AbstractDict{Symbol,<:AbstractExecutor}} = nothing,
 ) where T<:AbstractToken
     max_concurrency >= 1 || throw(ArgumentError("max_concurrency must be at least 1"))
     fuse >= 0 || throw(ArgumentError("fuse must be at least 0"))
+    _validate_on_event_error(on_event_error)
+    on_event = _normalize_event_hook(on_event, on_event_error)
 
     seeded = _seeded_run_keys(marking)
     if isempty(seeded)
@@ -1409,8 +1438,8 @@ function fire(
 
     state = _scheduler_state(marking)
 
-    run_executor(tid::Symbol, tokens::Vector{T}) =
-        execute(resolve_executor(net.transitions[tid].executor, executors), tid, tokens)
+    run_executor(ctx::ExecutionContext{T}) =
+        execute(resolve_executor(net.transitions[ctx.transition_id].executor, executors), ctx)
 
     completed = Channel{Task}(max_concurrency)
     interrupted = false

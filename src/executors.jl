@@ -1,11 +1,25 @@
 """
     Base type for transition executors.
-    Extend `execute(executor, tid, tokens)` for custom executors.
+    Extend `execute(executor, tid, tokens)` or `execute(executor, ctx)` for custom executors.
 """
 abstract type AbstractExecutor end
 
+"""
+    ExecutionContext{T<:AbstractToken}
+
+Public executor context carrying the firing metadata known by the engine.
+"""
+struct ExecutionContext{T<:AbstractToken}
+    transition_id::Symbol
+    bundle::BundleRef
+    firing_id::Int
+    attempt::Int
+    tokens::Vector{T}
+end
+
 execute(e::AbstractExecutor, tid::Symbol, tokens::Vector{<:AbstractToken}) =
     error("implement execute(::$(typeof(e)), ...)")
+execute(e::AbstractExecutor, ctx::ExecutionContext) = execute(e, ctx.transition_id, ctx.tokens)
 
 function register_executor! end
 function unregister_executor! end

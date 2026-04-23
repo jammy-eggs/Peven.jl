@@ -92,6 +92,13 @@ For keyed joins:
 
 Transitions look up executors by `executor::Symbol` in a process-global registry. For custom executors, subtype `AbstractExecutor`, extend `Peven.execute`, and register an instance with `register_executor!`. Use `unregister_executor!` for cleanup, or pass `fire(...; executors=Dict(...))` to inject executors without touching global registry state.
 
+Public executor entrypoints are:
+
+- `execute(executor, tid::Symbol, tokens::Vector{<:AbstractToken})`
+- `execute(executor, ctx::ExecutionContext)`
+
+`ExecutionContext` carries `transition_id`, `bundle`, `firing_id`, `attempt`, and `tokens`. `execute(executor, ctx)` falls back to `execute(executor, ctx.transition_id, ctx.tokens)`, so existing executors continue to work unchanged.
+
 Executor outputs follow these rules:
 
 - single-output transitions may return one token or a vector of tokens
@@ -109,7 +116,9 @@ Runtime behavior:
 - `take(...)` throws `ArgumentError("stale or unavailable bundle")` for a stale bundle
 - `fire` treats retries as new launches for fuse accounting
 - `hot` and `cold` are stateless snapshot helpers
-- `on_event` is observational only; ordinary hook exceptions are swallowed and never fail the scheduler
+- `fire(...; on_event_error=:ignore)` keeps `on_event` observational; ordinary hook exceptions are swallowed and never fail the scheduler
+- `fire(...; on_event_error=:throw)` rethrows hook exceptions for strict event delivery
+- `InterruptException` from `on_event` always aborts the scheduler immediately
 
 Events and traces:
 
