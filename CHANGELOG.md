@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.4.2
+
+- Add public `ExecutionContext` for adapter and custom executor integrations
+- Preserve executor compatibility by dispatching richer execution metadata through `execute(executor, ctx)` with fallback to `execute(executor, tid, tokens)`
+- Add `fire(...; on_event_error=:ignore | :throw)` so adapters can opt into strict event-hook delivery without changing the default best-effort behavior
+- Keep ordinary `on_event` hooks observational by default, while preserving immediate scheduler aborts for `InterruptException`
+- Document both public executor entrypoints in the README
+
 ## v0.4.1
 
 - Remove weighted output arcs and make branched transition outputs explicit per destination place

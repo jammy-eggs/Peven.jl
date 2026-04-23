@@ -4,7 +4,7 @@ export Color, AbstractToken, Token, Marking
 export color, run_key, run_keys, run_marking
 export Place, Transition, BundleRef, BundleEnablement, AbstractArc, ArcFrom, ArcTo, Net
 export ValidationIssue, validate
-export AbstractExecutor, FunctionExecutor
+export AbstractExecutor, ExecutionContext, FunctionExecutor
 export register_executor!, unregister_executor!
 export EngineEvent, TransitionStarted, TransitionCompleted, TransitionFailed, GuardErrored, SelectionErrored, RunFinished
 export TransitionResult, RunResult
