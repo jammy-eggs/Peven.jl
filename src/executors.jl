@@ -15,6 +15,7 @@ struct ExecutionContext{T<:AbstractToken}
     firing_id::Int
     attempt::Int
     tokens::Vector{T}
+    inputs_by_place::Dict{Symbol,Vector{T}}
 end
 
 execute(e::AbstractExecutor, tid::Symbol, tokens::Vector{<:AbstractToken}) =

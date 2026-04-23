@@ -11,6 +11,7 @@ struct TransitionStarted{T<:AbstractToken} <: EngineEvent
     firing_id::Int
     attempt::Int
     inputs::Vector{T}
+    inputs_by_place::Dict{Symbol,Vector{T}}
 end
 
 """

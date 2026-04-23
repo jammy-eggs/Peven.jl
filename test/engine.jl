@@ -368,8 +368,35 @@ queued_ready_ids(state) = Int[
             @test ctx.firing_id == started.firing_id == step.firing_id
             @test ctx.attempt == started.attempt == 1
             @test ctx.tokens === started.inputs
+            @test ctx.inputs_by_place === started.inputs_by_place
             @test length(ctx.tokens) == 1
             @test ctx.tokens[1].payload.payload == "work"
+            @test collect(keys(ctx.inputs_by_place)) == [:ready]
+            @test length(ctx.inputs_by_place[:ready]) == 1
+            @test ctx.inputs_by_place[:ready][1].payload.payload == "work"
+        end
+    end
+
+    @testset "fire: public input grouping is exposed by place" begin
+        net = keyed_join_net()
+        marking = Marking(Dict(
+            :left => Token[batch_token(:left, "r1", :a, "left-work")],
+            :right => Token[batch_token(:right, "r1", :a, "right-work")],
+        ))
+        events = EngineEvent[]
+        executor = RecordingExecutor(Any[])
+        with_executor(:default, executor) do
+            results = fire(net, marking; max_concurrency=1, on_event=e -> push!(events, e))
+            started = only([e for e in events if e isa TransitionStarted])
+            step = only(results[1].trace)
+            ctx = only(executor.contexts)
+
+            @test ctx.bundle == BundleRef(:join, "r1", :a, 1)
+            @test ctx.bundle == started.bundle == step.bundle
+            @test sort(collect(keys(ctx.inputs_by_place))) == [:left, :right]
+            @test ctx.inputs_by_place === started.inputs_by_place
+            @test [token.payload.payload for token in ctx.inputs_by_place[:left]] == ["left-work"]
+            @test [token.payload.payload for token in ctx.inputs_by_place[:right]] == ["right-work"]
         end
     end
 

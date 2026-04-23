@@ -1009,12 +1009,14 @@ function _spawn_execution_task(
     run_executor,
 ) where T<:AbstractToken
     inputs = copy(firing.grabbed)
+    inputs_by_place = Dict{Symbol,Vector{T}}(pid => copy(tokens) for (pid, tokens) in firing.grabbed_by_place)
     context = ExecutionContext(
         firing.bundle.transition_id,
         firing.bundle,
         firing.firing_id,
         firing.attempt,
         inputs,
+        inputs_by_place,
     )
     task = Threads.@spawn begin
         local result
@@ -1027,7 +1029,7 @@ function _spawn_execution_task(
         _safe_put_completed!(completed, current_task())
         result
     end
-    return task, inputs
+    return task, inputs, inputs_by_place
 end
 
 function _register_pending_firing!(
@@ -1035,10 +1037,17 @@ function _register_pending_firing!(
     task::Task,
     firing::_PendingFiring{T},
     inputs::Vector{T},
+    inputs_by_place::Dict{Symbol,Vector{T}},
     on_event,
 ) where T<:AbstractToken
     state.pending[task] = firing
-    emit(on_event, TransitionStarted(firing.bundle, firing.firing_id, firing.attempt, inputs))
+    emit(on_event, TransitionStarted(
+        firing.bundle,
+        firing.firing_id,
+        firing.attempt,
+        inputs,
+        inputs_by_place,
+    ))
     return nothing
 end
 
@@ -1076,7 +1085,7 @@ function _launch_ready_bundle!(
         grabbed_by_place,
     )
 
-    task, inputs = try
+    task, inputs, inputs_by_place = try
         _spawn_execution_task(completed, firing, run_executor)
     catch
         _set_ready_membership!(state, admission_id, record.status === :ready)
@@ -1085,7 +1094,7 @@ function _launch_ready_bundle!(
 
     state.marking = new_marking
     _drop_available_id!(state, admission_id)
-    _register_pending_firing!(state, task, firing, inputs, on_event)
+    _register_pending_firing!(state, task, firing, inputs, inputs_by_place, on_event)
     state.fired += 1
     _refresh_enablement!(state, net, net.recheck[record.bundle.transition_id]; on_event=on_event)
     return true
@@ -1154,8 +1163,8 @@ function _retry_firing!(
     firing.attempt = failed_attempt + 1
 
     try
-        task, inputs = _spawn_execution_task(completed, firing, run_executor)
-        _register_pending_firing!(state, task, firing, inputs, on_event)
+        task, inputs, inputs_by_place = _spawn_execution_task(completed, firing, run_executor)
+        _register_pending_firing!(state, task, firing, inputs, inputs_by_place, on_event)
     catch e
         firing.attempt = failed_attempt
         e isa InterruptException && rethrow()

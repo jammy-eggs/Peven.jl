@@ -97,7 +97,7 @@ Public executor entrypoints are:
 - `execute(executor, tid::Symbol, tokens::Vector{<:AbstractToken})`
 - `execute(executor, ctx::ExecutionContext)`
 
-`ExecutionContext` carries `transition_id`, `bundle`, `firing_id`, `attempt`, and `tokens`. `execute(executor, ctx)` falls back to `execute(executor, ctx.transition_id, ctx.tokens)`, so existing executors continue to work unchanged.
+`ExecutionContext` carries `transition_id`, `bundle`, `firing_id`, `attempt`, `tokens`, and `inputs_by_place`. `execute(executor, ctx)` falls back to `execute(executor, ctx.transition_id, ctx.tokens)`, so existing executors continue to work unchanged.
 
 Executor outputs follow these rules:
 
@@ -123,6 +123,7 @@ Runtime behavior:
 Events and traces:
 
 - `TransitionStarted`, `TransitionCompleted`, and `TransitionFailed` are emitted only for launched firings
+- `TransitionStarted` exposes both flattened `inputs` and grouped `inputs_by_place`
 - `GuardErrored(bundle, error)` and `SelectionErrored(transition_id, run_key, error)` report scheduler-time failures before or outside launched firings
 - completed events and `TransitionResult`s carry outputs keyed by destination place
 - each launched firing has a stable `firing_id`; retries increment `attempt` while keeping that same `firing_id`
