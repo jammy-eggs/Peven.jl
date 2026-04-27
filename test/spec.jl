@@ -54,9 +54,19 @@ using Main.Peven
         @test arc.transition === :judge
         @test arc.from === :ready
         @test arc.weight == 1
+        @test arc.optional == false
 
         weighted = ArcFrom(:judge, :ready, 3)
         @test weighted.weight == 3
+        @test weighted.optional == false
+
+        optional = ArcFrom(:judge, :planner_advice; optional=true)
+        @test optional.weight == 1
+        @test optional.optional == true
+
+        weighted_optional = ArcFrom(:judge, :planner_advice, 2; optional=true)
+        @test weighted_optional.weight == 2
+        @test weighted_optional.optional == true
 
         @test_throws ArgumentError ArcFrom(:judge, :ready, 0)
         @test_throws ArgumentError ArcFrom(:judge, :ready, -1)
@@ -92,12 +102,13 @@ using Main.Peven
     @testset "Net cached arc indexes" begin
         places = Dict(:a => Place(:a), :b => Place(:b), :c => Place(:c))
         transitions = Dict(:t1 => Transition(:t1), :t2 => Transition(:t2))
-        arcsfrom = [ArcFrom(:t1, :b, 2), ArcFrom(:t1, :a)]
+        arcsfrom = [ArcFrom(:t1, :b, 2), ArcFrom(:t1, :a; optional=true)]
         arcsto = [ArcTo(:t1, :c), ArcTo(:t2, :c)]
 
         net = Net(places, transitions, arcsfrom, arcsto)
 
-        @test net.input_arcs[:t1] == [(:b, 2), (:a, 1)]
+        @test [(spec.place, spec.weight, spec.optional) for spec in net.input_arcs[:t1]] ==
+            [(:b, 2, false), (:a, 1, true)]
         @test isempty(net.input_arcs[:t2])
         @test net.output_arcs[:t1] == [:c]
         @test net.output_arcs[:t2] == [:c]
@@ -113,7 +124,8 @@ using Main.Peven
             [ArcFrom(:join, :left), ArcFrom(:join, :left, 2)],
             [ArcTo(:join, :done)],
         )
-        @test duplicate_arc_net.input_arcs[:join] == [(:left, 1), (:left, 2)]
+        @test [(spec.place, spec.weight, spec.optional) for spec in duplicate_arc_net.input_arcs[:join]] ==
+            [(:left, 1, false), (:left, 2, false)]
 
         invalid_keyed_join_net = Net(
             places,
@@ -121,7 +133,8 @@ using Main.Peven
             [ArcFrom(:judge, :left)],
             [ArcTo(:judge, :done)],
         )
-        @test invalid_keyed_join_net.input_arcs[:judge] == [(:left, 1)]
+        @test [(spec.place, spec.weight, spec.optional) for spec in invalid_keyed_join_net.input_arcs[:judge]] ==
+            [(:left, 1, false)]
 
         net = Net(
             places,
@@ -129,7 +142,8 @@ using Main.Peven
             [ArcFrom(:join, :left), ArcFrom(:join, :right)],
             [ArcTo(:join, :done)],
         )
-        @test net.input_arcs[:join] == [(:left, 1), (:right, 1)]
+        @test [(spec.place, spec.weight, spec.optional) for spec in net.input_arcs[:join]] ==
+            [(:left, 1, false), (:right, 1, false)]
     end
 
 end

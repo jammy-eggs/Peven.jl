@@ -80,7 +80,12 @@ end
     end
 
     @testset "reachability" begin
-        net = toy_net(extra_transitions=Dict(:score => Transition(:score)))
+        net = Net(
+            Dict(:ready => Place(:ready, 2), :blocked => Place(:blocked), :done => Place(:done)),
+            Dict(:judge => Transition(:judge), :score => Transition(:score)),
+            [ArcFrom(:judge, :ready), ArcFrom(:score, :blocked)],
+            [ArcTo(:judge, :done), ArcTo(:score, :done)],
+        )
         marking = Marking(Dict(
             :ready => Token[Token(:redteam, "r1", 1)],
         ))
@@ -106,12 +111,13 @@ end
         net = Net(
             Dict(:left => Place(:left), :done => Place(:done)),
             Dict(:join => Transition(:join; join_by=join_by)),
-            [ArcFrom(:join, :left), ArcFrom(:join, :left, 2)],
+            [ArcFrom(:join, :left), ArcFrom(:join, :left, 2; optional=true)],
             [ArcTo(:join, :done)],
         )
 
         issues = validate(net)
         @test any(i -> i.code === :duplicate_input_arc && i.object_id === :join, issues)
+        @test any(i -> i.code === :optional_keyed_join && i.object_id === :join, issues)
         @test any(i -> i.code === :invalid_keyed_join && i.object_id === :join, issues)
     end
 
@@ -130,9 +136,9 @@ end
 
     @testset "arc weights that exceed place capacity are reported" begin
         net = Net(
-            Dict(:ready => Place(:ready, 1), :done => Place(:done, 1)),
+            Dict(:ready => Place(:ready, 1), :advice => Place(:advice, 1), :done => Place(:done, 1)),
             Dict(:judge => Transition(:judge)),
-            [ArcFrom(:judge, :ready, 2)],
+            [ArcFrom(:judge, :ready), ArcFrom(:judge, :advice, 2; optional=true)],
             [ArcTo(:judge, :done)],
         )
 
@@ -151,6 +157,31 @@ end
         issues = validate(net)
         @test count(i -> i.code === :weight_exceeds_capacity, issues) == 1
         @test any(i -> i.code === :duplicate_input_arc && i.object_id === :judge, issues)
+    end
+
+    @testset "transitions with zero required inputs are reported" begin
+        net = Net(
+            Dict(:advice => Place(:advice), :done => Place(:done)),
+            Dict(:judge => Transition(:judge)),
+            [ArcFrom(:judge, :advice; optional=true)],
+            [ArcTo(:judge, :done)],
+        )
+
+        issues = validate(net)
+        @test any(i -> i.code === :missing_required_input && i.object_id === :judge, issues)
+    end
+
+    @testset "keyed joins reject optional input arcs" begin
+        join_by = (pid, token) -> token.payload
+        net = Net(
+            Dict(:left => Place(:left), :right => Place(:right), :done => Place(:done)),
+            Dict(:join => Transition(:join; join_by=join_by)),
+            [ArcFrom(:join, :left), ArcFrom(:join, :right; optional=true)],
+            [ArcTo(:join, :done)],
+        )
+
+        issues = validate(net)
+        @test any(i -> i.code === :optional_keyed_join && i.object_id === :join, issues)
     end
 
     @testset "duplicate output arcs are reported by validate" begin

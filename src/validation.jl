@@ -42,6 +42,7 @@ let
     function validate!(issues::Vector{ValidationIssue}, net::Net)
         validate_keys!(issues, net)
         validate_arcs!(issues, net)
+        validate_required_input_structure!(issues, net)
         validate_keyed_join_structure!(issues, net)
         validate_output_arc_structure!(issues, net)
         validate_arc_capacity!(issues, net)
@@ -127,9 +128,29 @@ let
         return issues
     end
 
+    function validate_required_input_structure!(issues::Vector{ValidationIssue}, net::Net)
+        required_counts = Dict{Symbol,Int}()
+        for arc in net.arcsfrom
+            arc.optional && continue
+            required_counts[arc.transition] = get(required_counts, arc.transition, 0) + 1
+        end
+
+        for tid in keys(net.transitions)
+            get(required_counts, tid, 0) > 0 || push_issue!(
+                issues,
+                :missing_required_input,
+                tid,
+                "transition :$tid has no required input arcs",
+            )
+        end
+
+        return issues
+    end
+
     function validate_keyed_join_structure!(issues::Vector{ValidationIssue}, net::Net)
         seen_inputs = Set{Tuple{Symbol,Symbol}}()
         unique_inputs = Dict{Symbol,Set{Symbol}}()
+        optional_inputs = Set{Symbol}()
 
         for arc in net.arcsfrom
             key = (arc.transition, arc.from)
@@ -141,10 +162,17 @@ let
             )
             push!(seen_inputs, key)
             push!(get!(()->Set{Symbol}(), unique_inputs, arc.transition), arc.from)
+            arc.optional && push!(optional_inputs, arc.transition)
         end
 
         for (tid, transition) in net.transitions
             isnothing(transition.join_by) && continue
+            tid in optional_inputs && push_issue!(
+                issues,
+                :optional_keyed_join,
+                tid,
+                "transition :$tid uses join_by with optional input arcs, which is not supported",
+            )
             nunique = length(get(unique_inputs, tid, Set{Symbol}()))
             nunique >= 2 || push_issue!(
                 issues,

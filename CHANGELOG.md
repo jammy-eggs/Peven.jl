@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.4.4
+
+- Add optional input arcs with `ArcFrom(...; optional=true)` for places that may become active later and influence a transition without blocking required inputs
+- Include present optional tokens in unkeyed bundles, executor inputs, and `inputs_by_place`, while allowing absent optional places to stay empty
+- Validate optional-only transitions and keyed joins with optional input arcs as unsupported structures
+
 ## v0.4.3
 
 - Expose grouped transition inputs through `ExecutionContext.inputs_by_place` for executors, adapters, and callback layers
