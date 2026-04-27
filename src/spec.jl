@@ -88,16 +88,23 @@ struct ArcFrom <: AbstractArc
     transition::Symbol
     from::Symbol
     weight::Int
+    optional::Bool
 
-    function ArcFrom(transition::Symbol, from::Symbol, weight::Int=1)
+    function ArcFrom(transition::Symbol, from::Symbol, weight::Int=1; optional::Bool=false)
         weight > 0 || throw(ArgumentError("Arc weight must be positive"))
-        new(transition, from, weight)
+        new(transition, from, weight, optional)
     end
 end
 
 struct ArcTo <: AbstractArc
     transition::Symbol
     to::Symbol
+end
+
+struct InputArcSpec
+    place::Symbol
+    weight::Int
+    optional::Bool
 end
 
 
@@ -111,7 +118,7 @@ struct Net
     arcsfrom::Vector{ArcFrom}
     arcsto::Vector{ArcTo}
     children::Dict{Symbol,Vector{Symbol}}
-    input_arcs::Dict{Symbol,Vector{Tuple{Symbol,Int}}}
+    input_arcs::Dict{Symbol,Vector{InputArcSpec}}
     output_arcs::Dict{Symbol,Vector{Symbol}}
     affected_transitions::Dict{Symbol,Vector{Symbol}}
     upstream::Dict{Symbol,Vector{Symbol}}
@@ -125,7 +132,7 @@ struct Net
         arcsfrom::Vector{ArcFrom},
         arcsto::Vector{ArcTo},
         children::Dict{Symbol,Vector{Symbol}},
-        input_arcs::Dict{Symbol,Vector{Tuple{Symbol,Int}}},
+        input_arcs::Dict{Symbol,Vector{InputArcSpec}},
         output_arcs::Dict{Symbol,Vector{Symbol}},
         affected_transitions::Dict{Symbol,Vector{Symbol}},
         upstream::Dict{Symbol,Vector{Symbol}},
@@ -164,12 +171,15 @@ let
     end
 
     build_input_arcs(transitions, arcsfrom) = begin
-        inputs = Dict{Symbol,Vector{Tuple{Symbol,Int}}}()
+        inputs = Dict{Symbol,Vector{InputArcSpec}}()
         for tid in keys(transitions)
-            inputs[tid] = Tuple{Symbol,Int}[]
+            inputs[tid] = InputArcSpec[]
         end
         for arc in arcsfrom
-            push!(get!(() -> Tuple{Symbol,Int}[], inputs, arc.transition), (arc.from, arc.weight))
+            push!(
+                get!(() -> InputArcSpec[], inputs, arc.transition),
+                InputArcSpec(arc.from, arc.weight, arc.optional),
+            )
         end
         inputs
     end
@@ -197,7 +207,8 @@ let
         rivals = Dict{Symbol,Vector{Symbol}}()
         for tid in keys(transitions)
             seen = Set{Symbol}()
-            for (pid, _) in input_arcs[tid]
+            for spec in input_arcs[tid]
+                pid = spec.place
                 for rival in get(affected, pid, Symbol[])
                     rival == tid || push!(seen, rival)
                 end
@@ -248,7 +259,7 @@ let
             up,
             down,
             rchk,
-            Set{Symbol}(arc.from for arc in arcsfrom),
+            Set{Symbol}(arc.from for arc in arcsfrom if !arc.optional),
         )
     end
 end

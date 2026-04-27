@@ -66,14 +66,16 @@ end
 @inline _bundle_selected_key(triple::_BundleTriple) = triple[3]
 
 function _input_specs_for_transition(net::Net, transition::Transition)
-    input_specs = get(net.input_arcs, transition.id, Tuple{Symbol,Int}[])
+    input_specs = get(net.input_arcs, transition.id, InputArcSpec[])
     isnothing(transition.join_by) && return input_specs
-    return sort!(copy(input_specs); by=first)
+    return sort!(copy(input_specs); by=spec -> spec.place)
 end
 
 function _input_specs_for_bundle(net::Net, bundle::BundleRef)
     return _input_specs_for_transition(net, net.transitions[bundle.transition_id])
 end
+
+_required_input_specs(input_specs::Vector{InputArcSpec}) = [spec for spec in input_specs if !spec.optional]
 
 function _safe_showerror(err)
     try
@@ -109,10 +111,11 @@ function _collect_run_buckets(marking::Marking{T}, pid::Symbol) where T<:Abstrac
     return buckets
 end
 
-function _candidate_run_keys(input_specs::Vector{Tuple{Symbol,Int}}, by_place)
+function _candidate_run_keys(input_specs::Vector{InputArcSpec}, by_place)
     seen = Set{String}()
     ordered = String[]
-    for (pid, _) in input_specs
+    for spec in input_specs
+        pid = spec.place
         for rk in keys(get(by_place, pid, Dict{String,Vector}()))
             rk ∈ seen && continue
             push!(seen, rk)
@@ -144,20 +147,23 @@ function _unkeyed_bundles_for_run(
     tid::Symbol,
     rk::String,
     transition::Transition,
-    input_specs::Vector{Tuple{Symbol,Int}},
+    input_specs::Vector{InputArcSpec},
     by_place::Dict{Symbol,Dict{String,Vector{Tuple{Int,T}}}};
     in_flight::Set{BundleRef},
     on_guard_error = nothing,
 ) where T<:AbstractToken
+    required_specs = _required_input_specs(input_specs)
     chunks = Vector{Vector{Tuple{Int,T}}}()
-    sizehint!(chunks, length(input_specs))
-    for (pid, weight) in input_specs
+    sizehint!(chunks, length(required_specs))
+    for spec in required_specs
+        pid = spec.place
+        weight = spec.weight
         run_bucket = get(get(by_place, pid, Dict{String,Vector{Tuple{Int,T}}}()), rk, Tuple{Int,T}[])
         length(run_bucket) >= weight || return BundleEnablement{T}[]
         push!(chunks, run_bucket)
     end
 
-    bundle_count = minimum(div(length(chunks[i]), input_specs[i][2]) for i in eachindex(input_specs))
+    bundle_count = minimum(div(length(chunks[i]), required_specs[i].weight) for i in eachindex(required_specs))
     bundles = BundleEnablement{T}[]
     sizehint!(bundles, bundle_count)
 
@@ -165,10 +171,14 @@ function _unkeyed_bundles_for_run(
         bundle = BundleRef(tid, rk, nothing, ordinal)
         bundle ∈ in_flight && continue
         inputs = T[]
-        for (index, (_, weight)) in pairs(input_specs)
-            start = (ordinal - 1) * weight + 1
-            stop = start + weight - 1
-            for (_, token) in @view chunks[index][start:stop]
+        for spec in input_specs
+            run_bucket = get(get(by_place, spec.place, Dict{String,Vector{Tuple{Int,T}}}()), rk, Tuple{Int,T}[])
+            if spec.optional && length(run_bucket) < ordinal * spec.weight
+                continue
+            end
+            start = (ordinal - 1) * spec.weight + 1
+            stop = start + spec.weight - 1
+            for (_, token) in @view run_bucket[start:stop]
                 push!(inputs, token)
             end
         end
@@ -182,13 +192,13 @@ function _keyed_bundles_for_run(
     tid::Symbol,
     rk::String,
     transition::Transition,
-    input_specs::Vector{Tuple{Symbol,Int}},
+    input_specs::Vector{InputArcSpec},
     by_place::Dict{Symbol,Dict{String,Vector{Tuple{Int,T}}}};
     in_flight::Set{BundleRef},
     on_guard_error = nothing,
 ) where T<:AbstractToken
     selector = something(transition.join_by)
-    first_pid = input_specs[1][1]
+    first_pid = input_specs[1].place
     first_run_bucket = get(get(by_place, first_pid, Dict{String,Vector{Tuple{Int,T}}}()), rk, Tuple{Int,T}[])
 
     first_groups = Dict{Any,Vector{T}}()
@@ -203,7 +213,8 @@ function _keyed_bundles_for_run(
     end
 
     grouped = Dict{Symbol,Dict{Any,Vector{T}}}(first_pid => first_groups)
-    for (pid, _) in input_specs[2:end]
+    for spec in input_specs[2:end]
+        pid = spec.place
         run_bucket = get(get(by_place, pid, Dict{String,Vector{Tuple{Int,T}}}()), rk, Tuple{Int,T}[])
         keyed = Dict{Any,Vector{T}}()
         for (_, token) in run_bucket
@@ -216,7 +227,9 @@ function _keyed_bundles_for_run(
     bundles = BundleEnablement{T}[]
     for key in ordered_keys
         counts = Int[]
-        for (pid, weight) in input_specs
+        for spec in input_specs
+            pid = spec.place
+            weight = spec.weight
             place_groups = get(grouped, pid, Dict{Any,Vector{T}}())
             key_bucket = get(place_groups, key, T[])
             length(key_bucket) >= weight || (empty!(counts); break)
@@ -228,7 +241,9 @@ function _keyed_bundles_for_run(
             bundle = BundleRef(tid, rk, key, ordinal)
             bundle ∈ in_flight && continue
             inputs = T[]
-            for (pid, weight) in input_specs
+            for spec in input_specs
+                pid = spec.place
+                weight = spec.weight
                 place_bucket = grouped[pid][key]
                 start = (ordinal - 1) * weight + 1
                 stop = start + weight - 1
@@ -272,15 +287,17 @@ function _scan_enablement(
     for tid in live
         transition = net.transitions[tid]
         input_specs = _input_specs_for_transition(net, transition)
-        isempty(input_specs) && continue
+        required_specs = _required_input_specs(input_specs)
+        isempty(required_specs) && continue
         by_place = Dict{Symbol,Dict{String,Vector{Tuple{Int,T}}}}()
-        for (pid, _) in input_specs
+        for spec in input_specs
+            pid = spec.place
             by_place[pid] = get!(bucket_cache, pid) do
                 _collect_run_buckets(marking, pid)
             end
         end
 
-        for rk in _candidate_run_keys(input_specs, by_place)
+        for rk in _candidate_run_keys(required_specs, by_place)
             rk ∈ failed && continue
             bundles = BundleEnablement{T}[]
             if isnothing(transition.join_by)
@@ -546,7 +563,9 @@ function _claim_positions(marking::Marking{T}, net::Net, bundle::BundleRef) wher
     claimed_by_place = Dict{Symbol,Vector{T}}()
     selector = transition.join_by
 
-    for (pid, weight) in input_specs
+    for spec in input_specs
+        pid = spec.place
+        weight = spec.weight
         bucket = get(marking.tokens_by_place, pid, T[])
         start = (bundle.ordinal - 1) * weight + 1
         stop = start + weight - 1
@@ -581,7 +600,12 @@ function _claim_positions(marking::Marking{T}, net::Net, bundle::BundleRef) wher
             matched == stop && break
         end
 
-        matched >= stop || return nothing
+        if matched < stop
+            spec.optional || return nothing
+            claimed_positions[pid] = Int[]
+            claimed_by_place[pid] = T[]
+            continue
+        end
         claimed_positions[pid] = selected_positions
         claimed_by_place[pid] = selected_tokens
     end
@@ -602,7 +626,8 @@ function grab(marking::Marking{T}, net::Net, bundle::BundleRef) where T<:Abstrac
     grabbed = T[]
     sizehint!(grabbed, sum(length, values(grabbed_by_place)))
 
-    for (pid, _) in _input_specs_for_bundle(net, bundle)
+    for spec in _input_specs_for_bundle(net, bundle)
+        pid = spec.place
         bucket = get(marking.tokens_by_place, pid, T[])
         claimed = get(claimed_positions, pid, Int[])
         leftover = T[]

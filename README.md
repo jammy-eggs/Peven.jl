@@ -61,9 +61,9 @@ Peven is a colored Petri net engine where Places hold state, transitions do work
 
 - **Places** are states or buffers.
 - **Transitions** consume tokens from input Places and produce tokens into output Places. In practice, a firing is an executor call.
-- **Arcs** connect Places to transitions and transitions back to Places. The graph is always bipartite, and each arc has a weight.
+- **Arcs** connect Places to transitions and transitions back to Places. The graph is always bipartite, and each input arc has a weight and may be marked optional.
 - **Marking** is the current distribution of tokens across Places.
-- **Bundle** is the unit the scheduler actually fires. A `BundleRef` is `(transition_id, run_key, selected_key, ordinal)`, with `selected_key === nothing` for unkeyed transitions.
+- **Bundle** is the unit the scheduler actually fires. A `BundleRef` identifies one concrete firing candidate within a marking snapshot: transition, `run_key`, the optional keyed-join selector (`selected_key`), and a positive sibling index that distinguishes multiple bundles for the same selector. For unkeyed transitions, `selected_key === nothing`.
 
 A practical token schema is:
 
@@ -78,6 +78,7 @@ A transition is hot when at least one bundle is ready. Firing claims one concret
 
 - **Branch / `tee`** -- the canonical one-to-many fork idiom. A transition with multiple output Places must emit explicit per-place outputs, typically `Dict(place => Token[...])`. Nothing is duplicated implicitly; if two downstream branches need the same information, the executor must emit two tokens.
 - **Self-loop** -- deposit back into an input Place when the graph itself should keep evolving, such as revise-until-good loops and iterative refinement.
+- **Optional input arc** -- use `ArcFrom(:transition, :place; optional=true)` when a Place may become active later and should influence a transition if present without blocking the required inputs.
 - **Retries** -- use transition `retries` when you mean "retry the same firing after failure", not "send the work back around the graph".
 - **Keyed join** -- use `Transition(...; join_by=(place_id, token) -> key)` to correlate multi-place inputs within one `run_key`. `join_by` is classification, not evaluation.
 
@@ -171,6 +172,8 @@ Structural keyed-join issues are reported by `validate(...)`; `Net(...)` constru
 Current validation rules include:
 
 - `join_by` is valid only on transitions with at least two unique input Places
+- every transition must have at least one required input arc
+- optional input arcs are supported for unkeyed transitions; keyed joins reject optional inputs
 - duplicate input arcs for the same `(transition, place)` are rejected; use `weight` instead
 - duplicate output arcs for the same `(transition, place)` are rejected; use one output arc per destination place
 - input arc weights may not exceed the capacity of a bounded connected Place

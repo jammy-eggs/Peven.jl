@@ -32,6 +32,14 @@ function branch_net()
     return Net(places, transitions, arcsfrom, arcsto)
 end
 
+function optional_advice_net()
+    places = Dict(:ready => Place(:ready), :planner_advice => Place(:planner_advice), :done => Place(:done))
+    transitions = Dict(:judge => Transition(:judge))
+    arcsfrom = [ArcFrom(:judge, :ready), ArcFrom(:judge, :planner_advice; optional=true)]
+    arcsto = [ArcTo(:judge, :done)]
+    return Net(places, transitions, arcsfrom, arcsto)
+end
+
 function unkeyed_join_net(; guard=nothing, retries=0, arc_order=[:left, :right])
     places = Dict(:left => Place(:left), :right => Place(:right), :done => Place(:done))
     transitions = Dict(:join => Transition(:join; guard=guard, retries=retries))
@@ -323,6 +331,63 @@ queued_ready_ids(state) = Int[
         @test_throws ArgumentError take(new_marking, net, second_bundle)
     end
 
+    @testset "optional inputs: absent tokens do not block required bundles" begin
+        net = optional_advice_net()
+        marking = Marking(Dict(:ready => Token[batch_token(:ready, "r1", :a, "work")]))
+
+        entries = enablement(net, marking)
+        @test length(entries) == 1
+        @test entries[1].status === :ready
+        @test [token.payload.payload for token in entries[1].inputs] == ["work"]
+
+        _, grabbed, grabbed_by_place = take(marking, net, entries[1].bundle)
+        @test [token.payload.payload for token in grabbed] == ["work"]
+        @test [token.payload.payload for token in grabbed_by_place[:ready]] == ["work"]
+        @test isempty(grabbed_by_place[:planner_advice])
+    end
+
+    @testset "optional inputs: present tokens are consumed and passed" begin
+        net = optional_advice_net()
+        marking = Marking(Dict(
+            :ready => Token[batch_token(:ready, "r1", :a, "work")],
+            :planner_advice => Token[batch_token(:planner_advice, "r1", :a, "advice")],
+        ))
+
+        entries = enablement(net, marking)
+        @test length(entries) == 1
+        @test [token.payload.payload for token in entries[1].inputs] == ["work", "advice"]
+
+        new_marking, grabbed, grabbed_by_place = take(marking, net, entries[1].bundle)
+        @test [token.payload.payload for token in grabbed] == ["work", "advice"]
+        @test [token.payload.payload for token in grabbed_by_place[:planner_advice]] == ["advice"]
+        @test isempty(new_marking.tokens_by_place[:ready])
+        @test isempty(new_marking.tokens_by_place[:planner_advice])
+    end
+
+    @testset "optional inputs: required input absent still blocks" begin
+        net = optional_advice_net()
+        marking = Marking(Dict(:planner_advice => Token[batch_token(:planner_advice, "r1", :a, "advice")]))
+
+        @test isempty(hot(net, marking))
+        @test grab(marking, net, BundleRef(:judge, "r1", nothing, 1)) === nothing
+    end
+
+    @testset "optional inputs: stale optional token does not stale the bundle" begin
+        net = optional_advice_net()
+        initial = Marking(Dict(
+            :ready => Token[batch_token(:ready, "r1", :a, "work")],
+            :planner_advice => Token[batch_token(:planner_advice, "r1", :a, "advice")],
+        ))
+        bundle = only(hot(net, initial))
+        marking = Marking(Dict(:ready => Token[batch_token(:ready, "r1", :a, "work")]))
+
+        result = grab(marking, net, bundle)
+        @test result !== nothing
+        _, grabbed, grabbed_by_place = something(result)
+        @test [token.payload.payload for token in grabbed] == ["work"]
+        @test isempty(grabbed_by_place[:planner_advice])
+    end
+
     @testset "hot: in_flight filters BundleRef" begin
         net = chain_net()
         marking = Marking(Dict(:ready => Token[Token("r1")]))
@@ -397,6 +462,50 @@ queued_ready_ids(state) = Int[
             @test ctx.inputs_by_place === started.inputs_by_place
             @test [token.payload.payload for token in ctx.inputs_by_place[:left]] == ["left-work"]
             @test [token.payload.payload for token in ctx.inputs_by_place[:right]] == ["right-work"]
+        end
+    end
+
+    @testset "fire: optional input grouping records absent places" begin
+        net = optional_advice_net()
+        marking = Marking(Dict(:ready => Token[batch_token(:ready, "r1", :a, "work")]))
+        events = EngineEvent[]
+        executor = RecordingExecutor(Any[])
+        with_executor(:default, executor) do
+            results = fire(net, marking; max_concurrency=1, on_event=e -> push!(events, e))
+            started = only([e for e in events if e isa TransitionStarted])
+            ctx = only(executor.contexts)
+
+            @test results[1].status === :completed
+            @test sort(collect(keys(ctx.inputs_by_place))) == [:planner_advice, :ready]
+            @test ctx.inputs_by_place === started.inputs_by_place
+            @test [token.payload.payload for token in ctx.inputs_by_place[:ready]] == ["work"]
+            @test isempty(ctx.inputs_by_place[:planner_advice])
+        end
+    end
+
+    @testset "fire: optional inputs can be re-emitted as ordinary tokens" begin
+        net = Net(
+            Dict(:ready => Place(:ready), :planner_advice => Place(:planner_advice), :done => Place(:done)),
+            Dict(:judge => Transition(:judge)),
+            [ArcFrom(:judge, :ready), ArcFrom(:judge, :planner_advice; optional=true)],
+            [ArcTo(:judge, :planner_advice), ArcTo(:judge, :done)],
+        )
+        marking = Marking(Dict(
+            :ready => Token[batch_token(:ready, "r1", :a, "work")],
+            :planner_advice => Token[batch_token(:planner_advice, "r1", :a, "advice")],
+        ))
+        executor = FunctionExecutor((_, tokens) -> Dict(
+            :planner_advice => Token[token for token in tokens if color(token) === :planner_advice],
+            :done => Token[Token(:done, run_key(tokens[1]), "done")],
+        ))
+
+        with_executor(:default, executor) do
+            events = EngineEvent[]
+            results = fire(net, marking; max_concurrency=1, on_event=e -> push!(events, e))
+            started = only([e for e in events if e isa TransitionStarted])
+            @test results[1].status === :completed
+            @test [token.payload.payload for token in started.inputs_by_place[:planner_advice]] == ["advice"]
+            @test [token.payload.payload for token in results[1].final_marking.tokens_by_place[:planner_advice]] == ["advice"]
         end
     end
 
@@ -1127,6 +1236,37 @@ queued_ready_ids(state) = Int[
         with_executor(:default, FunctionExecutor(passthrough)) do
             @test_throws ArgumentError fire(net, marking; max_concurrency=0)
             @test_throws ArgumentError fire(net, marking; fuse=-1)
+        end
+    end
+
+    @testset "fire: optional-only transitions fail validation preflight" begin
+        net = Net(
+            Dict(:planner_advice => Place(:planner_advice), :done => Place(:done)),
+            Dict(:judge => Transition(:judge)),
+            [ArcFrom(:judge, :planner_advice; optional=true)],
+            [ArcTo(:judge, :done)],
+        )
+        marking = Marking(Dict(:planner_advice => Token[batch_token(:planner_advice, "r1", :a, "advice")]))
+
+        with_executor(:default, FunctionExecutor(passthrough)) do
+            @test_throws ArgumentError fire(net, marking; max_concurrency=1)
+        end
+    end
+
+    @testset "fire: keyed joins with optional arcs fail validation preflight" begin
+        net = Net(
+            Dict(:left => Place(:left), :right => Place(:right), :done => Place(:done)),
+            Dict(:join => Transition(:join; join_by=(pid, token) -> token.payload.item)),
+            [ArcFrom(:join, :left), ArcFrom(:join, :right; optional=true)],
+            [ArcTo(:join, :done)],
+        )
+        marking = Marking(Dict(
+            :left => Token[batch_token(:left, "r1", :a)],
+            :right => Token[batch_token(:right, "r1", :a)],
+        ))
+
+        with_executor(:default, FunctionExecutor(passthrough)) do
+            @test_throws ArgumentError fire(net, marking; max_concurrency=1)
         end
     end
 
