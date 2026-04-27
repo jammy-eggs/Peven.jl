@@ -6,6 +6,12 @@
 - Include present optional tokens in unkeyed bundles, executor inputs, and `inputs_by_place`, while allowing absent optional places to stay empty
 - Validate optional-only transitions and keyed joins with optional input arcs as unsupported structures
 
+Breaking changes:
+
+- `validate(...)` and `fire(...)` now reject transitions that have no required input arcs; optional-only transitions need a required seed or control input
+- `join_by` transitions now reject optional input arcs; make keyed inputs required, or model optional advice/context through an unkeyed transition
+- `Net.input_arcs` entries are now `InputArcSpec` values with `.place`, `.weight`, and `.optional` fields instead of `(place, weight)` tuples
+
 ## v0.4.3
 
 - Expose grouped transition inputs through `ExecutionContext.inputs_by_place` for executors, adapters, and callback layers
