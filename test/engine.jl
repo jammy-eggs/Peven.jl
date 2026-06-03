@@ -79,9 +79,9 @@ end
 
 @testset "src/engine" begin
     @testset "evaluate_guard" begin
-        @test evaluate_guard(nothing, []) == true
-        @test evaluate_guard(ts -> length(ts) > 0, [Token("r1")]) == true
-        @test evaluate_guard(ts -> length(ts) > 5, [Token("r1")]) == false
+        @test Peven.evaluate_guard(nothing, []) == true
+        @test Peven.evaluate_guard(ts -> length(ts) > 0, [Token("r1")]) == true
+        @test Peven.evaluate_guard(ts -> length(ts) > 5, [Token("r1")]) == false
     end
 
     # ── drop ───────────────────────────────────────────────────────────────
@@ -166,12 +166,12 @@ end
             :a => Token[Token(:red, "r1", 1), Token(:blue, "r2", 2)],
             :b => Token[Token(:red, "r1", 3)],
         ))
-        keys = fuses(marking)
+        keys = Peven.fuses(marking)
         @test Set(keys) == Set(["r1", "r2"])
     end
 
     @testset "fuses: empty" begin
-        @test isempty(fuses(Marking()))
+        @test isempty(Peven.fuses(Marking()))
     end
 
     # ── run_completed ─────────────────────────────────────────────────────────
@@ -204,12 +204,12 @@ end
 
     @testset "emit" begin
         # emit with nothing hook does nothing
-        emit(nothing, TransitionStarted(:t, "r1", 1, 1, Token[]))
+        Peven.emit(nothing, TransitionStarted(:t, "r1", 1, 1, Token[]))
 
         # emit with hook calls it
         events = EngineEvent[]
         hook = e -> push!(events, e)
-        emit(hook, TransitionStarted(:t, "r1", 1, 1, Token[]))
+        Peven.emit(hook, TransitionStarted(:t, "r1", 1, 1, Token[]))
         @test length(events) == 1
         @test events[1] isa TransitionStarted
         @test events[1].transition_id === :t
