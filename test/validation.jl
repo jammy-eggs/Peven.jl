@@ -3,13 +3,13 @@ module SrcValidationTests
 using Test
 using Main.Peven
 
-function toy_net(; extra_transitions=Dict{Symbol, Transition}())
+function toyNet(; extraTransitions=Dict{Symbol, Transition}())
     places = Dict(
         :ready => Place(:ready, 2),
         :done  => Place(:done),
     )
     transitions = Dict(:judge => Transition(:judge))
-    merge!(transitions, extra_transitions)
+    merge!(transitions, extraTransitions)
     arcsfrom = [ArcFrom(:judge, :ready)]
     arcsto = [ArcTo(:judge, :done)]
     return Net(places, transitions, arcsfrom, arcsto)
@@ -17,7 +17,7 @@ end
 
 @testset "src/validation" begin
     @testset "valid net and state" begin
-        net = toy_net()
+        net = toyNet()
         marking = Marking(Dict(
             :ready => Token[Token(:redteam, "r1", 1)],
         ))
@@ -35,7 +35,7 @@ end
         )
 
         issues = validate(net)
-        @test any(i -> i.code === :key_mismatch && i.object_id === :ready, issues)
+        @test any(i -> i.code === :keyMismatch && i.objectId === :ready, issues)
     end
 
     @testset "arc endpoint checks" begin
@@ -47,22 +47,22 @@ end
         )
 
         issues = validate(net)
-        @test any(i -> i.code === :unknown_place && i.object_id === :missing, issues)
-        @test any(i -> i.code === :unknown_transition && i.object_id === :ghost, issues)
-        @test any(i -> i.code === :unknown_place && i.object_id === :done, issues)
-        @test any(i -> i.code === :unknown_transition && i.object_id === :phantom, issues)
+        @test any(i -> i.code === :unknownPlace && i.objectId === :missing, issues)
+        @test any(i -> i.code === :unknownTransition && i.objectId === :ghost, issues)
+        @test any(i -> i.code === :unknownPlace && i.objectId === :done, issues)
+        @test any(i -> i.code === :unknownTransition && i.objectId === :phantom, issues)
     end
 
     @testset "marking checks accumulate" begin
-        net = toy_net()
+        net = toyNet()
         marking = Marking(Dict(
             :ghost => Token[Token(:redteam, "r1", 1)],
             :ready => Token[Token(:redteam, "r1", 1), Token(:baseline, "r2", 2), Token(:gold, "r3", 3)],
         ))
 
         issues = validate(net, marking)
-        @test any(i -> i.code === :unknown_place && i.object_id === :ghost, issues)
-        @test any(i -> i.code === :capacity_exceeded && i.object_id === :ready, issues)
+        @test any(i -> i.code === :unknownPlace && i.objectId === :ghost, issues)
+        @test any(i -> i.code === :capacityExceeded && i.objectId === :ready, issues)
     end
 
     @testset "orphan places" begin
@@ -74,20 +74,20 @@ end
         )
 
         issues = validate(net)
-        @test any(i -> i.code === :orphan_place && i.object_id === :lonely, issues)
+        @test any(i -> i.code === :orphanPlace && i.objectId === :lonely, issues)
         # :ready and :done have arcs, so they should not be flagged
-        @test !any(i -> i.code === :orphan_place && i.object_id === :ready, issues)
-        @test !any(i -> i.code === :orphan_place && i.object_id === :done, issues)
+        @test !any(i -> i.code === :orphanPlace && i.objectId === :ready, issues)
+        @test !any(i -> i.code === :orphanPlace && i.objectId === :done, issues)
     end
 
     @testset "reachability" begin
-        net = toy_net(extra_transitions=Dict(:score => Transition(:score)))
+        net = toyNet(extraTransitions=Dict(:score => Transition(:score)))
         marking = Marking(Dict(
             :ready => Token[Token(:redteam, "r1", 1)],
         ))
 
         issues = validate(net, marking)
-        @test any(i -> i.code === :unreachable_transition && i.object_id === :score, issues)
+        @test any(i -> i.code === :unreachableTransition && i.objectId === :score, issues)
     end
 end
 

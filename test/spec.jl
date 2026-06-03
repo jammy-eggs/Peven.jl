@@ -28,9 +28,9 @@ using Main.Peven
         @test t2.executor === :agent
         @test t2.retries == 2
 
-        guard_fn = tokens -> length(tokens) > 0
-        t3 = Transition(:gate, :default; guard=guard_fn)
-        @test t3.guard === guard_fn
+        guardFn = tokens -> length(tokens) > 0
+        t3 = Transition(:gate, :default; guard=guardFn)
+        @test t3.guard === guardFn
 
         @test_throws ArgumentError Transition(:bad; retries=-1)
     end
@@ -78,7 +78,7 @@ using Main.Peven
         @test net.arcsto === arcsto
         @test net.children[:ready] == [:judge]
         @test net.children[:judge] == [:done]
-        @test net.from_places == Set([:ready])
+        @test net.fromPlaces == Set([:ready])
     end
 
     @testset "Net cached arc indexes" begin
@@ -89,21 +89,21 @@ using Main.Peven
 
         net = Net(places, transitions, arcsfrom, arcsto)
 
-        # input_arcs: t1 has two input arcs, t2 has none
-        @test length(net.input_arcs[:t1]) == 2
-        @test isempty(net.input_arcs[:t2])
+        # inputArcs: t1 has two input arcs, t2 has none
+        @test length(net.inputArcs[:t1]) == 2
+        @test isempty(net.inputArcs[:t2])
 
-        # Check tuples contain (place_id, weight)
-        t1_inputs = Set(net.input_arcs[:t1])
-        @test (:a, 1) ∈ t1_inputs
-        @test (:b, 2) ∈ t1_inputs
+        # Check tuples contain (placeId, weight)
+        t1Inputs = Set(net.inputArcs[:t1])
+        @test (:a, 1) ∈ t1Inputs
+        @test (:b, 2) ∈ t1Inputs
 
-        # output_arcs: t1 and t2 each have one output to :c
-        @test net.output_arcs[:t1] == [(:c, 1)]
-        @test net.output_arcs[:t2] == [(:c, 1)]
+        # outputArcs: t1 and t2 each have one output to :c
+        @test net.outputArcs[:t1] == [(:c, 1)]
+        @test net.outputArcs[:t2] == [(:c, 1)]
     end
 
-    @testset "Net affected_transitions (reverse index)" begin
+    @testset "Net affectedTransitions (reverse index)" begin
         places = Dict(:a => Place(:a), :b => Place(:b), :c => Place(:c))
         transitions = Dict(:t1 => Transition(:t1), :t2 => Transition(:t2))
         arcsfrom = [ArcFrom(:t1, :a), ArcFrom(:t1, :b, 2), ArcFrom(:t2, :a)]
@@ -112,11 +112,11 @@ using Main.Peven
         net = Net(places, transitions, arcsfrom, arcsto)
 
         # :a feeds both :t1 and :t2
-        @test Set(net.affected_transitions[:a]) == Set([:t1, :t2])
+        @test Set(net.affectedTransitions[:a]) == Set([:t1, :t2])
         # :b feeds only :t1
-        @test net.affected_transitions[:b] == [:t1]
+        @test net.affectedTransitions[:b] == [:t1]
         # :c is an output place — no transitions consume from it
-        @test !haskey(net.affected_transitions, :c)
+        @test !haskey(net.affectedTransitions, :c)
     end
 
     @testset "Net upstream / downstream (LoLA 2 indexes)" begin

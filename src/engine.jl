@@ -2,17 +2,17 @@
     Check whether a transition's guard allows firing
     Nothing guard always passes, Function guard is called with the peeked tokens
 """
-@inline evaluate_guard(::Nothing, _) = true
-@inline evaluate_guard(guard::Function, tokens) = guard(tokens)
+@inline evaluateGuard(::Nothing, _) = true
+@inline evaluateGuard(guard::Function, tokens) = guard(tokens)
 
 """
-    Drop a token into the output places of a fired transition
+    Drop a token into the output places of a launched transition
     Copy-on-write: returns a new Marking, original is unchanged
     Throws ArgumentError if any output place would exceed its capacity
 """
 function drop(marking::Marking{T}, net::Net, tid::Symbol, token::T) where T<:AbstractToken
-    tokens = Dict{Symbol, Vector{T}}(k => copy(v) for (k, v) in marking.tokens_by_place)
-    for (pid, weight) in net.output_arcs[tid]
+    tokens = Dict{Symbol, Vector{T}}(k => copy(v) for (k, v) in marking.tokensByPlace)
+    for (pid, weight) in net.outputArcs[tid]
         bucket = get!(() -> T[], tokens, pid)
         cap = net.places[pid].capacity
         for _ in 1:weight
@@ -38,17 +38,17 @@ function drop(
 ) where {T<:AbstractToken, S<:T}
     isempty(outputs) && throw(ArgumentError("executor output vector must be non-empty"))
 
-    arcs = get(net.output_arcs, tid, Tuple{Symbol, Int}[])
+    arcs = get(net.outputArcs, tid, Tuple{Symbol, Int}[])
     length(arcs) == 1 || throw(ArgumentError("executor output vector requires exactly one output arc"))
     pid, weight = only(arcs)
     weight == 1 || throw(ArgumentError("executor output vector requires a weight-1 output arc"))
 
-    bucket = get(marking.tokens_by_place, pid, T[])
+    bucket = get(marking.tokensByPlace, pid, T[])
     cap = net.places[pid].capacity
     !isnothing(cap) && length(bucket) + length(outputs) > cap &&
         throw(ArgumentError("capacity exceeded at :$pid"))
 
-    tokens = Dict{Symbol, Vector{T}}(k => copy(v) for (k, v) in marking.tokens_by_place)
+    tokens = Dict{Symbol, Vector{T}}(k => copy(v) for (k, v) in marking.tokensByPlace)
     deposited = copy(bucket)
     append!(deposited, outputs)
     tokens[pid] = deposited
@@ -60,27 +60,27 @@ end
     Restores the marking to its pre-grab state
     No capacity check needed because these tokens were already in these places
 """
-function misfire(marking::Marking{T}, grabbed_by_place::Dict{Symbol, Vector{T}}) where T<:AbstractToken
-    restored = Dict{Symbol, Vector{T}}(k => copy(v) for (k, v) in marking.tokens_by_place)
-    for (pid, returned) in grabbed_by_place
+function misfire(marking::Marking{T}, grabbedByPlace::Dict{Symbol, Vector{T}}) where T<:AbstractToken
+    restored = Dict{Symbol, Vector{T}}(k => copy(v) for (k, v) in marking.tokensByPlace)
+    for (pid, returned) in grabbedByPlace
         append!(get!(() -> T[], restored, pid), returned)
     end
     return Marking(restored)
 end
 
 """
-    Collect the unique run_keys from the initial marking in first-seen order
+    Collect the unique runKeys from the initial marking in first-seen order
     These are the fuses the engine will light
 """
 function fuses(marking::Marking)
-    n = sum(length, values(marking.tokens_by_place); init=0)
+    n = sum(length, values(marking.tokensByPlace); init=0)
     seen = Set{String}()
     sizehint!(seen, n)
     ordered = String[]
     sizehint!(ordered, n)
-    for tokens in values(marking.tokens_by_place)
+    for tokens in values(marking.tokensByPlace)
         for token in tokens
-            rk = run_key(token)
+            rk = runKey(token)
             if rk ∉ seen
                 push!(seen, rk)
                 push!(ordered, rk)
@@ -91,28 +91,28 @@ function fuses(marking::Marking)
 end
 
 """
-    Check if a run_key's tokens have all left from-places (places with outgoing arcs)
-    Returns true when no tokens for this run_key remain in any from-place
+    Check if a runKey's tokens have all left from-places (places with outgoing arcs)
+    Returns true when no tokens for this runKey remain in any from-place
 """
-function run_completed(marking::Marking, rk::String, from_places::Set{Symbol})
-    for (pid, tokens) in marking.tokens_by_place
-        pid ∈ from_places || continue
-        any(t -> run_key(t) == rk, tokens) && return false
+function isComplete(marking::Marking, rk::String, fromPlaces::Set{Symbol})
+    for (pid, tokens) in marking.tokensByPlace
+        pid ∈ fromPlaces || continue
+        any(t -> runKey(t) == rk, tokens) && return false
     end
     return true
 end
 
 """
-    Extract the final marking snapshot for one run_key
-    Keeps only that run_key's tokens across all places and drops empty places
+    Extract the final marking snapshot for one runKey
+    Keeps only that runKey's tokens across all places and drops empty places
 """
-function run_marking(marking::Marking{T}, rk::String) where T<:AbstractToken
+function finalMarking(marking::Marking{T}, rk::String) where T<:AbstractToken
     filtered = Dict{Symbol, Vector{T}}()
-    sizehint!(filtered, length(marking.tokens_by_place))
-    for (pid, tokens) in marking.tokens_by_place
+    sizehint!(filtered, length(marking.tokensByPlace))
+    for (pid, tokens) in marking.tokensByPlace
         kept = T[]
         for token in tokens
-            run_key(token) == rk && push!(kept, token)
+            runKey(token) == rk && push!(kept, token)
         end
         isempty(kept) || (filtered[pid] = kept)
     end
@@ -125,11 +125,11 @@ end
 """
 function take(marking::Marking{T}, net::Net, tid::Symbol, rk::String) where T<:AbstractToken
     result = grab(marking, net, tid, rk)
-    isnothing(result) && throw(ArgumentError("transition :$tid not enabled for run_key=$rk"))
+    isnothing(result) && throw(ArgumentError("transition :$tid not enabled for runKey=$rk"))
     return result
 end
 
-function _normalize_outputs(output, ::Type{T}) where T<:AbstractToken
+function normalize(output, ::Type{T}) where T<:AbstractToken
     if output isa T
         return T[output]
     end
@@ -147,18 +147,18 @@ function _normalize_outputs(output, ::Type{T}) where T<:AbstractToken
 end
 
 """
-    Which (transition, run_key) pairs are hot — ready to fire from the current marking?
-    Returns a sorted list of primed (transition, run_key) pairs, filtered by failed/in_flight/guards
+    Which (transition, runKey) pairs are hot — ready to fire from the current marking?
+    Returns a sorted list of primed (transition, runKey) pairs, filtered by failed/inFlight/guards
     check=nothing scans all transitions, check=[tids] scans only those with live tokens
-    on_guard_error receives (tid, rk, exception) when a guard crashes — nothing means silent
+    onGuardError receives (tid, rk, exception) when a guard crashes — nothing means silent
 """
 function hot(
     net::Net,
     marking::Marking{T};
     failed::Set{String} = Set{String}(),
-    in_flight::Set{Tuple{Symbol, String}} = Set{Tuple{Symbol, String}}(),
+    inFlight::Set{Tuple{Symbol, String}} = Set{Tuple{Symbol, String}}(),
     check::Union{Nothing, Vector{Symbol}} = nothing,
-    on_guard_error = nothing,
+    onGuardError = nothing,
 ) where T<:AbstractToken
 
     result = Tuple{Symbol, String}[]
@@ -167,25 +167,25 @@ function hot(
     live = check === nothing ? sort!(collect(keys(net.transitions))) : check
 
     for tid in live
-        arcs = net.input_arcs[tid]
+        arcs = net.inputArcs[tid]
         isempty(arcs) && continue
 
-        # For each input place, count tokens per run_key.
-        # Keep only run_keys with enough tokens, then intersect across all input places.
+        # For each input place, count tokens per runKey.
+        # Keep only runKeys with enough tokens, then intersect across all input places.
         # First input place seeds candidates, each subsequent place narrows via intersect
         candidates = nothing
         for (pid, weight) in arcs
-            toks = get(marking.tokens_by_place, pid, T[])
+            toks = get(marking.tokensByPlace, pid, T[])
             counts = Dict{String, Int}()
             for t in toks
-                rk = run_key(t)
+                rk = runKey(t)
                 counts[rk] = get(counts, rk, 0) + 1
             end
-            can_fire = Set(rk for (rk, cnt) in counts if cnt >= weight)
+            canFire = Set(rk for (rk, cnt) in counts if cnt >= weight)
             if candidates === nothing
-                candidates = can_fire
+                candidates = canFire
             else
-                intersect!(candidates, can_fire)
+                intersect!(candidates, canFire)
             end
         end
 
@@ -194,14 +194,14 @@ function hot(
 
         for rk in sort!(collect(candidates))
             rk ∈ failed && continue
-            (tid, rk) ∈ in_flight && continue
+            (tid, rk) ∈ inFlight && continue
 
             # Peek tokens that would be grabbed (read-only, no marking change)
             peeked = T[]
             for (pid, weight) in arcs
                 n = 0
-                for t in get(marking.tokens_by_place, pid, T[])
-                    run_key(t) == rk || continue
+                for t in get(marking.tokensByPlace, pid, T[])
+                    runKey(t) == rk || continue
                     push!(peeked, t)
                     n += 1
                     n >= weight && break
@@ -210,9 +210,9 @@ function hot(
 
             # Guard check — false or exception means skip
             try
-                evaluate_guard(net.transitions[tid].guard, peeked) || continue
+                evaluateGuard(net.transitions[tid].guard, peeked) || continue
             catch e
-                on_guard_error !== nothing && on_guard_error(tid, rk, e)
+                onGuardError !== nothing && onGuardError(tid, rk, e)
                 continue
             end
 
@@ -224,7 +224,7 @@ function hot(
 end
 
 """
-    Which transitions have no enabled run_key — the inverse of hot()
+    Which transitions have no enabled runKey — the inverse of hot()
     Returns a sorted list of transition ids that cannot fire from the current marking
     Respects the same scan subset and filters as hot()
     Useful for diagnosing deadlocks and incomplete runs
@@ -233,26 +233,26 @@ function cold(
     net::Net,
     marking::Marking{T};
     failed::Set{String} = Set{String}(),
-    in_flight::Set{Tuple{Symbol, String}} = Set{Tuple{Symbol, String}}(),
+    inFlight::Set{Tuple{Symbol, String}} = Set{Tuple{Symbol, String}}(),
     check::Union{Nothing, Vector{Symbol}} = nothing,
-    on_guard_error = nothing,
+    onGuardError = nothing,
 ) where T<:AbstractToken
     enabled = Set{Symbol}(tid for (tid, _) in hot(
         net, marking;
         failed=failed,
-        in_flight=in_flight,
+        inFlight=inFlight,
         check=check,
-        on_guard_error=on_guard_error,
+        onGuardError=onGuardError,
     ))
     scanned = check === nothing ? sort!(collect(keys(net.transitions))) : sort!(collect(Set(check)))
     return [tid for tid in scanned if tid ∉ enabled]
 end
 
 """
-    Try to grab tokens from input places for a transition and run_key
-    Returns (new_marking, grabbed, grabbed_by_place) or nothing if not enough tokens
+    Try to grab tokens from input places for a transition and runKey
+    Returns (newMarking, grabbed, grabbedByPlace) or nothing if not enough tokens
     Copy-on-write: original marking is unchanged
-    Multi-place selection is keyed by run_key only: when several eligible tokens exist
+    Multi-place selection is keyed by runKey only: when several eligible tokens exist
     in multiple input places for the same run, grab claims the first available tokens
     per place. A keyed-join extension for correlated multi-place inputs is intentionally
     deferred.
@@ -264,19 +264,19 @@ function grab(
     rk::String,
 ) where T<:AbstractToken
 
-    tokens = Dict{Symbol, Vector{T}}(k => copy(v) for (k, v) in marking.tokens_by_place)
+    tokens = Dict{Symbol, Vector{T}}(k => copy(v) for (k, v) in marking.tokensByPlace)
     grabbed = T[]
-    grabbed_by_place = Dict{Symbol, Vector{T}}()
+    grabbedByPlace = Dict{Symbol, Vector{T}}()
 
-    for (pid, weight) in net.input_arcs[tid]
+    for (pid, weight) in net.inputArcs[tid]
         bucket = get(tokens, pid, T[])
-        available = count(t -> run_key(t) == rk, bucket)
+        available = count(t -> runKey(t) == rk, bucket)
         available < weight && return nothing
 
         claimed = T[]
         leftover = T[]
         for token in bucket
-            if run_key(token) == rk && length(claimed) < weight
+            if runKey(token) == rk && length(claimed) < weight
                 push!(claimed, token)
             else
                 push!(leftover, token)
@@ -284,35 +284,35 @@ function grab(
         end
 
         append!(grabbed, claimed)
-        grabbed_by_place[pid] = claimed
+        grabbedByPlace[pid] = claimed
         tokens[pid] = leftover
     end
 
-    return (Marking(tokens), grabbed, grabbed_by_place)
+    return (Marking(tokens), grabbed, grabbedByPlace)
 end
 
-mutable struct _PendingFiring{T<:AbstractToken}
-    transition_id::Symbol
-    run_key::String
-    firing_id::Int
+mutable struct Fired{T<:AbstractToken}
+    transitionId::Symbol
+    runKey::String
+    firingId::Int
     attempt::Int
     grabbed::Vector{T}
-    grabbed_by_place::Dict{Symbol, Vector{T}}
+    grabbedByPlace::Dict{Symbol, Vector{T}}
 end
 
 """
     Run the engine to completion
     fuse limits total transition launches before stopping, including retries
     Once fuse is exhausted the engine launches no new firings, but lets in-flight work drain
-    max_concurrency caps how many transitions run in parallel
-    on_event receives EngineEvent instances as they happen
+    maxConcurrency caps how many transitions run in parallel
+    onEvent receives EngineEvent instances as they happen
 """
 function fire(
     net::Net,
     marking::Marking{T};
     fuse::Int = 1000,
-    max_concurrency::Int = 10,
-    on_event = nothing,
+    maxConcurrency::Int = 10,
+    onEvent = nothing,
 ) where T <: AbstractToken
 
     issues = validate(net, marking)
@@ -322,217 +322,248 @@ function fire(
     isempty(seeded) && return RunResult{T}[]
 
     trace = TransitionResult{T}[]
-    failed_runs = Set{String}()
-    fired = 0
-    next_firing_id = 1
+    failedRuns = Set{String}()
+    guardErrors = Dict{Tuple{Symbol, String}, String}()
+    launched = 0
+    nextId = 1
 
-    run_executor(tid::Symbol, tokens::Vector{T}) =
-        execute(get_executor(net.transitions[tid].executor), tid, tokens)
+    runExec(tid::Symbol, tokens::Vector{T}) =
+        execute(getExec(net.transitions[tid].executor), tid, tokens)
 
-    allocate_firing_id!() = (firing_id = next_firing_id; next_firing_id += 1; firing_id)
+    nextId!() = (id = nextId; nextId += 1; id)
 
-    function guard_error(tid, rk, e)
+    function guardError(tid, rk, e)
         msg = sprint(showerror, e)
-        firing_id = allocate_firing_id!()
-        push!(trace, TransitionResult(tid, rk, firing_id, :failed, T[], msg, 1))
-        emit(on_event, TransitionFailed(tid, rk, firing_id, 1, msg, false))
+        guardErrors[(tid, rk)] = msg
+        emit(onEvent, GuardErrored(tid, rk, msg))
     end
 
-    ready = Tuple{Symbol, String}[]
-    ready_set = Set{Tuple{Symbol, String}}()
-    pending = Dict{Task, _PendingFiring{T}}()
-    completed = Channel{Task}(max_concurrency)
+    readyQ = Tuple{Symbol, String}[]
+    readySet = Set{Tuple{Symbol, String}}()
+    pending = Dict{Task, Fired{T}}()
+    done = Channel{Task}(maxConcurrency)
 
-    function rebuild_ready!()
-        empty!(ready)
-        empty!(ready_set)
-        for pair in hot(net, marking; failed=failed_runs, on_guard_error=guard_error)
-            push!(ready, pair)
-            push!(ready_set, pair)
+    function reset!()
+        empty!(readyQ)
+        empty!(readySet)
+        empty!(guardErrors)
+        for pair in hot(net, marking; failed=failedRuns, onGuardError=guardError)
+            push!(readyQ, pair)
+            push!(readySet, pair)
         end
         return nothing
     end
 
-    function refresh_ready!(check::Vector{Symbol})
+    function refresh!(check::Vector{Symbol})
         affected = Set(check)
-        filter!(ready) do pair
-            keep = pair[1] ∉ affected && pair[2] ∉ failed_runs
-            keep || delete!(ready_set, pair)
+        for pair in collect(keys(guardErrors))
+            pair[1] ∈ affected && delete!(guardErrors, pair)
+        end
+        filter!(readyQ) do pair
+            keep = pair[1] ∉ affected && pair[2] ∉ failedRuns
+            keep || delete!(readySet, pair)
             keep
         end
-        for pair in hot(net, marking; failed=failed_runs, check=check, on_guard_error=guard_error)
-            pair ∈ ready_set && continue
-            push!(ready, pair)
-            push!(ready_set, pair)
+        for pair in hot(net, marking; failed=failedRuns, check=check, onGuardError=guardError)
+            pair ∈ readySet && continue
+            push!(readyQ, pair)
+            push!(readySet, pair)
         end
         return nothing
     end
 
-    function pop_ready!()
-        while !isempty(ready)
-            pair = popfirst!(ready)
-            delete!(ready_set, pair)
-            pair[2] ∈ failed_runs && continue
+    function popNext!()
+        while !isempty(readyQ)
+            pair = popfirst!(readyQ)
+            delete!(readySet, pair)
+            pair[2] ∈ failedRuns && continue
             return pair
         end
         return nothing
     end
 
-    function spawn_task!(firing::_PendingFiring{T})
-        inputs = copy(firing.grabbed)
-        emit(on_event, TransitionStarted(
-            firing.transition_id,
-            firing.run_key,
-            firing.firing_id,
-            firing.attempt,
+    function spawnTask!(fired::Fired{T})
+        inputs = copy(fired.grabbed)
+        emit(onEvent, TransitionStarted(
+            fired.transitionId,
+            fired.runKey,
+            fired.firingId,
+            fired.attempt,
             inputs,
         ))
         task = Threads.@spawn begin
             local result
             try
-                result = run_executor(firing.transition_id, inputs)
+                result = runExec(fired.transitionId, inputs)
             catch
-                put!(completed, current_task())
+                put!(done, current_task())
                 rethrow()
             end
-            put!(completed, current_task())
+            put!(done, current_task())
             result
         end
-        pending[task] = firing
+        pending[task] = fired
         return nothing
     end
 
-    function spawn_ready!()
-        while length(pending) < max_concurrency && fired < fuse
-            pair = pop_ready!()
+    function launchNext!()
+        while length(pending) < maxConcurrency && launched < fuse
+            pair = popNext!()
             isnothing(pair) && break
 
             tid, rk = pair
             result = grab(marking, net, tid, rk)
             isnothing(result) && continue
 
-            marking, grabbed, grabbed_by_place = result
-            firing = _PendingFiring(
+            marking, grabbed, grabbedByPlace = result
+            fired = Fired(
                 tid,
                 rk,
-                allocate_firing_id!(),
+                nextId!(),
                 1,
                 grabbed,
-                grabbed_by_place,
+                grabbedByPlace,
             )
-            fired += 1
-            spawn_task!(firing)
-            refresh_ready!(net.recheck[tid])
+            launched += 1
+            spawnTask!(fired)
+            refresh!(net.recheck[tid])
         end
         return nothing
     end
 
-    rebuild_ready!()
-    spawn_ready!()
+    reset!()
+    launchNext!()
 
     # take! blocks until a task puts itself on the channel — no spinning
     while !isempty(pending)
-        done = take!(completed)
-        try; wait(done); catch; end  # ensure task has fully exited
-        firing = pending[done]
-        delete!(pending, done)
+        task = take!(done)
+        try; wait(task); catch; end  # ensure task has fully exited
+        fired = pending[task]
+        delete!(pending, task)
 
-        if istaskfailed(done)
-            msg = sprint(showerror, done.result)
-            transition = net.transitions[firing.transition_id]
-            if firing.attempt <= transition.retries && fired < fuse
-                emit(on_event, TransitionFailed(
-                    firing.transition_id,
-                    firing.run_key,
-                    firing.firing_id,
-                    firing.attempt,
+        if istaskfailed(task)
+            msg = sprint(showerror, task.result)
+            transition = net.transitions[fired.transitionId]
+            if fired.attempt <= transition.retries && launched < fuse
+                emit(onEvent, TransitionFailed(
+                    fired.transitionId,
+                    fired.runKey,
+                    fired.firingId,
+                    fired.attempt,
                     msg,
                     true,
                 ))
-                firing.attempt += 1
-                fired += 1
-                spawn_task!(firing)
-            elseif firing.attempt <= transition.retries
-                marking = misfire(marking, firing.grabbed_by_place)
-            else
+                fired.attempt += 1
+                launched += 1
+                spawnTask!(fired)
+            elseif fired.attempt <= transition.retries
+                marking = misfire(marking, fired.grabbedByPlace)
                 push!(trace, TransitionResult(
-                    firing.transition_id,
-                    firing.run_key,
-                    firing.firing_id,
+                    fired.transitionId,
+                    fired.runKey,
+                    fired.firingId,
                     :failed,
                     T[],
                     msg,
-                    firing.attempt,
+                    fired.attempt,
                 ))
-                push!(failed_runs, firing.run_key)
-                emit(on_event, TransitionFailed(
-                    firing.transition_id,
-                    firing.run_key,
-                    firing.firing_id,
-                    firing.attempt,
+                emit(onEvent, TransitionFailed(
+                    fired.transitionId,
+                    fired.runKey,
+                    fired.firingId,
+                    fired.attempt,
                     msg,
                     false,
                 ))
-                refresh_ready!(net.recheck[firing.transition_id])
+            else
+                push!(trace, TransitionResult(
+                    fired.transitionId,
+                    fired.runKey,
+                    fired.firingId,
+                    :failed,
+                    T[],
+                    msg,
+                    fired.attempt,
+                ))
+                push!(failedRuns, fired.runKey)
+                emit(onEvent, TransitionFailed(
+                    fired.transitionId,
+                    fired.runKey,
+                    fired.firingId,
+                    fired.attempt,
+                    msg,
+                    false,
+                ))
+                refresh!(net.recheck[fired.transitionId])
             end
         else
-            output = fetch(done)
-            outputs = _normalize_outputs(output, T)
+            output = fetch(task)
+            outputs = normalize(output, T)
             marking = output isa AbstractVector ?
-                drop(marking, net, firing.transition_id, outputs) :
-                drop(marking, net, firing.transition_id, only(outputs))
+                drop(marking, net, fired.transitionId, outputs) :
+                drop(marking, net, fired.transitionId, only(outputs))
             push!(trace, TransitionResult(
-                firing.transition_id,
-                firing.run_key,
-                firing.firing_id,
+                fired.transitionId,
+                fired.runKey,
+                fired.firingId,
                 :completed,
                 outputs,
                 nothing,
-                firing.attempt,
+                fired.attempt,
             ))
-            emit(on_event, TransitionCompleted(
-                firing.transition_id,
-                firing.run_key,
-                firing.firing_id,
-                firing.attempt,
+            emit(onEvent, TransitionCompleted(
+                fired.transitionId,
+                fired.runKey,
+                fired.firingId,
+                fired.attempt,
                 outputs,
             ))
-            refresh_ready!(net.recheck[firing.transition_id])
+            refresh!(net.recheck[fired.transitionId])
         end
 
-        spawn_ready!()
+        launchNext!()
     end
 
     traces = Dict{String, Vector{TransitionResult{T}}}()
     for r in trace
-        push!(get!(() -> TransitionResult{T}[], traces, r.run_key), r)
+        push!(get!(() -> TransitionResult{T}[], traces, r.runKey), r)
     end
 
     results = RunResult{T}[]
     for rk in seeded
         steps = get(traces, rk, TransitionResult{T}[])
 
-        # Order matters: failed > completed > fuse_exhausted > deadlocked
-        if rk ∈ failed_runs
+        # Order matters: failed > completed > fuseExhausted > deadlocked
+        if rk ∈ failedRuns
             status = :failed
-            reason = :executor_failed
+            reason = :executorFailed
             err = last(r.error for r in steps if r.status === :failed)
-        elseif run_completed(marking, rk, net.from_places)
+        elseif isComplete(marking, rk, net.fromPlaces)
             status = :completed
             reason = nothing
             err = nothing
-        elseif fired >= fuse
-            status = :incomplete
-            reason = :fuse_exhausted
-            err = nothing
         else
-            status = :incomplete
-            reason = :no_enabled_transition
-            err = nothing
+            erroredGuards = sort!(Symbol[
+                tid for ((tid, key), _) in guardErrors if key == rk
+            ])
+            if !isempty(erroredGuards)
+                tid = first(erroredGuards)
+                status = :failed
+                reason = :guardError
+                err = guardErrors[(tid, rk)]
+            elseif launched >= fuse
+                status = :incomplete
+                reason = :fuseExhausted
+                err = nothing
+            else
+                status = :incomplete
+                reason = :noEnabledTransition
+                err = nothing
+            end
         end
 
-        result = RunResult(rk, status, err, reason, steps, run_marking(marking, rk))
-        emit(on_event, RunFinished(result))
+        result = RunResult(rk, status, err, reason, steps, finalMarking(marking, rk))
+        emit(onEvent, RunFinished(result))
         push!(results, result)
     end
 

@@ -8,22 +8,22 @@ abstract type AbstractExecutor end
 execute(e::AbstractExecutor, tid::Symbol, tokens::Vector{<:AbstractToken}) =
     error("implement execute(::$(typeof(e)), ...)")
 
-const EXECUTOR_REGISTRY = Dict{Symbol, AbstractExecutor}()
+const registry = Dict{Symbol, AbstractExecutor}()
 
 """
     Register an executor under a name so Transitions can reference it
-    register_executor!(:agent, MyAgentExecutor()) makes Transition(:gen, :agent) use it
+    registerExec!(:agent, MyAgentExecutor()) makes Transition(:gen, :agent) use it
     The registry is process-global, so tests and applications should clean up names they reuse
 """
-register_executor!(name::Symbol, executor::AbstractExecutor) =
-    (EXECUTOR_REGISTRY[name] = executor; nothing)
+registerExec!(name::Symbol, executor::AbstractExecutor) =
+    (registry[name] = executor; nothing)
 
 """
     Look up a registered executor by name, throws KeyError if not found
 """
-function get_executor(name::Symbol)
-    haskey(EXECUTOR_REGISTRY, name) || throw(KeyError("no executor registered for :$name"))
-    return EXECUTOR_REGISTRY[name]
+function getExec(name::Symbol)
+    haskey(registry, name) || throw(KeyError("no executor registered for :$name"))
+    return registry[name]
 end
 
 """

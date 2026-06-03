@@ -1,12 +1,12 @@
 module Peven
 
 export Color, AbstractToken, Token, Marking
-export color, run_key
+export color, runKey
 export Place, Transition, AbstractArc, ArcFrom, ArcTo, Net
 export ValidationIssue, validate
 export AbstractExecutor, FunctionExecutor
-export register_executor!, get_executor
-export EngineEvent, TransitionStarted, TransitionCompleted, TransitionFailed, RunFinished
+export registerExec!, getExec
+export EngineEvent, TransitionStarted, TransitionCompleted, TransitionFailed, GuardErrored, RunFinished
 export TransitionResult, RunResult
 export hot, cold, grab, take, drop, misfire, fire
 
