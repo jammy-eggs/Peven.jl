@@ -32,12 +32,27 @@ struct Transition
     executor::Symbol
     guard::Union{Nothing,Function}
     retries::Int
+    joinBy::Union{Nothing,Function}
 
-    function Transition(id::Symbol, executor::Symbol=:default; guard=nothing, retries::Int=0)
+    function Transition(id::Symbol, executor::Symbol=:default; guard=nothing, retries::Int=0, joinBy=nothing)
         retries >= 0 || throw(ArgumentError("retries must be non-negative"))
-        new(id, executor, guard, retries)
+        new(id, executor, guard, retries, joinBy)
     end
 end
+
+struct Bundle
+    transitionId::Symbol
+    runKey::String
+    selectedKey::Any
+end
+
+Base.:(==)(a::Bundle, b::Bundle) =
+    a.transitionId === b.transitionId &&
+    a.runKey == b.runKey &&
+    isequal(a.selectedKey, b.selectedKey)
+Base.isequal(a::Bundle, b::Bundle) = a == b
+Base.hash(b::Bundle, h::UInt) =
+    hash((b.transitionId, b.runKey, b.selectedKey), h)
 
 """
     Arcs connect Places and Transitions
@@ -51,10 +66,11 @@ struct ArcFrom <: AbstractArc
     transition::Symbol
     from::Symbol
     weight::Int
+    optional::Bool
 
-    function ArcFrom(transition::Symbol, from::Symbol, weight::Int=1)
+    function ArcFrom(transition::Symbol, from::Symbol, weight::Int=1; optional::Bool=false)
         weight > 0 || throw(ArgumentError("Arc weight must be positive"))
-        new(transition, from, weight)
+        new(transition, from, weight, optional)
     end
 end
 
@@ -75,7 +91,7 @@ end
     ArcsFrom maps Places to a list of Transitions
     ArcsTo maps Transitions to a list of Places
 """
-function build_children(arcsfrom::Vector{ArcFrom}, arcsto::Vector{ArcTo})
+function buildChildren(arcsfrom::Vector{ArcFrom}, arcsto::Vector{ArcTo})
     children = Dict{Symbol,Vector{Symbol}}()
     sizehint!(children, length(arcsfrom) + length(arcsto)) # perf: pre-allocate space
     for arc in arcsfrom
@@ -91,13 +107,16 @@ end
     Build index of each Transition to the Places it consumes from and how many tokens it needs from the Place
     :judge => [(:ready, 2)] means :judge needs 2 tokens from :ready to fire
 """
-function build_input_arcs(transitions, arcsfrom)
-    inputs = Dict{Symbol,Vector{Tuple{Symbol,Int}}}()
+function buildInputArcs(transitions, arcsfrom)
+    inputs = Dict{Symbol,Vector{Tuple{Symbol,Int,Bool}}}()
     for tid in keys(transitions)
-        inputs[tid] = Tuple{Symbol,Int}[]
+        inputs[tid] = Tuple{Symbol,Int,Bool}[]
     end
     for arc in arcsfrom
-        push!(get!(() -> Tuple{Symbol,Int}[], inputs, arc.transition), (arc.from, arc.weight))
+        push!(
+            get!(() -> Tuple{Symbol,Int,Bool}[], inputs, arc.transition),
+            (arc.from, arc.weight, arc.optional),
+        )
     end
     return inputs
 end
@@ -106,7 +125,7 @@ end
     Build index of each Transition to the Places it deposits into and how many tokens it deposits into each Place
     :judge => [(:done, 1)] means :judge deposits 1 token into :done after firing
 """
-function build_output_arcs(transitions, arcsto)
+function buildOutputArcs(transitions, arcsto)
     outputs = Dict{Symbol,Vector{Tuple{Symbol,Int}}}()
     for tid in keys(transitions)
         outputs[tid] = Tuple{Symbol,Int}[]
@@ -124,7 +143,7 @@ end
     ArcTo arcs affect where tokens land after firing, not whether a transition can fire
     Used as a building block for the precomputed upstream/downstream indexes
 """
-function build_affected_transitions(arcsfrom)
+function buildAffectedTransitions(arcsfrom)
     affected = Dict{Symbol,Vector{Symbol}}()
     for arc in arcsfrom
         push!(get!(() -> Symbol[], affected, arc.from), arc.transition)
@@ -151,11 +170,11 @@ end
     After firing t, re-check: t ∪ upstream[t] ∪ downstream[t]
     Net precomputes that full set as recheck[t] so fire() can reuse it directly
 """
-function build_upstream(transitions, input_arcs, affected)
+function buildUpstream(transitions, inputArcs, affected)
     rivals = Dict{Symbol,Vector{Symbol}}()
     for tid in keys(transitions)
         seen = Set{Symbol}()
-        for (pid, _) in input_arcs[tid]
+        for (pid, _, _) in inputArcs[tid]
             for rival in get(affected, pid, Symbol[])
                 rival == tid || push!(seen, rival)
             end
@@ -165,11 +184,11 @@ function build_upstream(transitions, input_arcs, affected)
     return rivals
 end
 
-function build_downstream(transitions, output_arcs, affected)
+function buildDownstream(transitions, outputArcs, affected)
     successors = Dict{Symbol,Vector{Symbol}}()
     for tid in keys(transitions)
         seen = Set{Symbol}()
-        for (pid, _) in output_arcs[tid]
+        for (pid, _) in outputArcs[tid]
             for neighbor in get(affected, pid, Symbol[])
                 push!(seen, neighbor)  # include self — cycles re-enable the same transition
             end
@@ -183,14 +202,14 @@ end
     Net is the complete Petri net graph — Places, Transitions, and Arcs
     Caches indexes at construction for fast runtime access:
       children:               adjacency list for reachability checks
-      input_arcs:             Transition -> [(Place, weight)] for consumption
-      output_arcs:            Transition -> [(Place, weight)] for deposit
-      affected_transitions:   Place -> [Transitions] reverse index (building block)
+      inputArcs:             Transition -> [(Place, weight, optional)] for consumption
+      outputArcs:            Transition -> [(Place, weight)] for deposit
+      affectedTransitions:   Place -> [Transitions] reverse index (building block)
       upstream:               Transition -> [input-side contender transitions] that might lose
                               enablement after firing
       downstream:             Transition -> [Transitions] that might gain enablement after firing
       recheck:                Transition -> [Transitions] precomputed union of tid ∪ upstream ∪ downstream
-      from_places:            Set of Places with outgoing arcs — tokens here haven't reached a sink
+      fromPlaces:            Set of Places with outgoing arcs — tokens here haven't reached a sink
 """
 struct Net
     places::Dict{Symbol,Place}
@@ -198,13 +217,13 @@ struct Net
     arcsfrom::Vector{ArcFrom}
     arcsto::Vector{ArcTo}
     children::Dict{Symbol,Vector{Symbol}}
-    input_arcs::Dict{Symbol,Vector{Tuple{Symbol,Int}}}
-    output_arcs::Dict{Symbol,Vector{Tuple{Symbol,Int}}}
-    affected_transitions::Dict{Symbol,Vector{Symbol}}
+    inputArcs::Dict{Symbol,Vector{Tuple{Symbol,Int,Bool}}}
+    outputArcs::Dict{Symbol,Vector{Tuple{Symbol,Int}}}
+    affectedTransitions::Dict{Symbol,Vector{Symbol}}
     upstream::Dict{Symbol,Vector{Symbol}}
     downstream::Dict{Symbol,Vector{Symbol}}
     recheck::Dict{Symbol,Vector{Symbol}}
-    from_places::Set{Symbol}
+    fromPlaces::Set{Symbol}
 
     function Net(
         places::Dict{Symbol,Place},
@@ -212,18 +231,18 @@ struct Net
         arcsfrom::Vector{ArcFrom},
         arcsto::Vector{ArcTo},
     )
-        input = build_input_arcs(transitions, arcsfrom)
-        output = build_output_arcs(transitions, arcsto)
-        affected = build_affected_transitions(arcsfrom)
-        up = build_upstream(transitions, input, affected)
-        down = build_downstream(transitions, output, affected)
+        input = buildInputArcs(transitions, arcsfrom)
+        output = buildOutputArcs(transitions, arcsto)
+        affected = buildAffectedTransitions(arcsfrom)
+        up = buildUpstream(transitions, input, affected)
+        down = buildDownstream(transitions, output, affected)
         # Precompute the full recheck set per transition: tid ∪ upstream ∪ downstream
         rchk = Dict{Symbol,Vector{Symbol}}()
         for tid in keys(transitions)
             rchk[tid] = sort!(collect(union(Set([tid]), up[tid], down[tid])))
         end
         new(places, transitions, arcsfrom, arcsto,
-            build_children(arcsfrom, arcsto),
+            buildChildren(arcsfrom, arcsto),
             input, output, affected, up, down, rchk,
             Set{Symbol}(arc.from for arc in arcsfrom))
     end

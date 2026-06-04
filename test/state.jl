@@ -11,19 +11,19 @@ using Main.Peven
         @test tok isa Token
         @test tok isa AbstractToken
         @test color(tok) === :redteam
-        @test run_key(tok) == "run1"
+        @test runKey(tok) == "run1"
         @test tok.payload == 42
 
-        str_tok = Token(:baseline, "run2", "draft")
-        @test color(str_tok) === :baseline
-        @test run_key(str_tok) == "run2"
-        @test str_tok.payload == "draft"
+        strTok = Token(:baseline, "run2", "draft")
+        @test color(strTok) === :baseline
+        @test runKey(strTok) == "run2"
+        @test strTok.payload == "draft"
     end
 
     @testset "Token convenience" begin
         bare = Token("run1")
         @test color(bare) === :default
-        @test run_key(bare) == "run1"
+        @test runKey(bare) == "run1"
         @test bare.payload === nothing
 
         colored = Token(:gold, "run2")
@@ -37,15 +37,15 @@ using Main.Peven
             :done  => Token[],
         ))
         @test m isa Marking{Token}
-        @test length(m.tokens_by_place[:ready]) == 1
-        @test isempty(m.tokens_by_place[:done])
+        @test length(m.tokensByPlace[:ready]) == 1
+        @test isempty(m.tokensByPlace[:done])
 
-        empty_m = Marking()
-        @test empty_m isa Marking{Token}
-        @test isempty(empty_m.tokens_by_place)
+        emptyM = Marking()
+        @test emptyM isa Marking{Token}
+        @test isempty(emptyM.tokensByPlace)
 
-        typed_empty = Marking{AbstractToken}()
-        @test typed_empty isa Marking{AbstractToken}
+        typedEmpty = Marking{AbstractToken}()
+        @test typedEmpty isa Marking{AbstractToken}
     end
 end
 

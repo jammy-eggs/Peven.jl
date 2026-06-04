@@ -1,6 +1,6 @@
 """
-    Events emitted during engine execution via the on_event hook
-    Pass on_event = e -> push!(log, e) to fire() to capture them
+    Events emitted during engine execution via the onEvent hook
+    Pass onEvent = e -> push!(log, e) to fire() to capture them
 """
 abstract type EngineEvent end
 
@@ -9,21 +9,16 @@ abstract type EngineEvent end
     inputs contains the tokens reserved for this firing
 """
 struct TransitionStarted{T<:AbstractToken} <: EngineEvent
-    transition_id::Symbol
-    run_key::String
-    firing_id::Int
-    attempt::Int
-    inputs::Vector{T}
+    ctx::ExecutionContext{T}
 end
 
 """
     Emitted when a transition completes successfully
-    outputs contains the executor's pre-fan-out outputs
+    outputs contains the executor's returned tokens
 """
 struct TransitionCompleted{T<:AbstractToken} <: EngineEvent
-    transition_id::Symbol
-    run_key::String
-    firing_id::Int
+    bundle::Bundle
+    firingId::Int
     attempt::Int
     outputs::Vector{T}
 end
@@ -33,12 +28,29 @@ end
     retrying is true if the firing will be re-attempted, false if retries are exhausted
 """
 struct TransitionFailed <: EngineEvent
-    transition_id::Symbol
-    run_key::String
-    firing_id::Int
+    bundle::Bundle
+    firingId::Int
     attempt::Int
     error::String
     retrying::Bool
+end
+
+"""
+    Emitted when a guard throws during enablement evaluation.
+    Guard exceptions are scheduler observations, not launched firings.
+"""
+struct GuardErrored <: EngineEvent
+    bundle::Bundle
+    error::String
+end
+
+"""
+    Emitted when joinBy throws or returns nothing before a bundle can be formed.
+"""
+struct SelectionErrored <: EngineEvent
+    transitionId::Symbol
+    runKey::String
+    error::String
 end
 
 @inline emit(::Nothing, _) = nothing
@@ -47,61 +59,60 @@ end
 """
     Record of a terminal transition outcome kept in a run trace
     status is :completed or :failed
-    outputs holds the executor's pre-fan-out outputs on success, error holds the message on failure
-    Failed entries capture terminal executor failures and guard errors
+    outputs holds the executor's returned tokens on success, error holds the message on failure
+    Failed entries capture launched firings that ended in terminal failure
 """
 struct TransitionResult{T<:AbstractToken}
-    transition_id::Symbol
-    run_key::String
-    firing_id::Int
+    bundle::Bundle
+    firingId::Int
     status::Symbol
     outputs::Vector{T}
     error::Union{Nothing, String}
     attempts::Int
 
     function TransitionResult(
-        transition_id::Symbol,
-        run_key::String,
-        firing_id::Int,
+        bundle::Bundle,
+        firingId::Int,
         status::Symbol,
         outputs::Vector{T},
         error::Union{Nothing, String},
         attempts::Int,
     ) where {T<:AbstractToken}
-        new{T}(transition_id, run_key, firing_id, status, outputs, error, attempts)
+        new{T}(bundle, firingId, status, outputs, error, attempts)
     end
 end
 
 """
-    Final result for one run_key after the engine finishes
+    Final result for one runKey after the engine finishes
     status is :completed, :failed, or :incomplete
-    terminal_reason explains why: :executor_failed, :fuse_exhausted, :no_enabled_transition
-    trace holds the recorded outcomes for this run_key in engine order
+    reason explains why: :executorFailed, :guardError, :fuseExhausted, :noEnabledTransition
+    trace holds the recorded outcomes for this runKey in engine order
     retrying failures are emitted as events but are not retained in trace
-    final_marking keeps only this run_key's tokens when fire() stopped
+    terminal failures, including retries blocked by fuse exhaustion, are retained in trace
+    finalMarking keeps only this runKey's tokens when fire() stopped
 """
 struct RunResult{T<:AbstractToken}
-    run_key::String
+    runKey::String
     status::Symbol
     error::Union{Nothing, String}
-    terminal_reason::Union{Nothing, Symbol}
+    reason::Union{Nothing, Symbol}
     trace::Vector{TransitionResult{T}}
-    final_marking::Marking{T}
+    finalMarking::Marking{T}
 
     function RunResult(
-        run_key::String,
+        runKey::String,
         status::Symbol,
         error::Union{Nothing, String},
-        terminal_reason::Union{Nothing, Symbol},
+        reason::Union{Nothing, Symbol},
         trace::Vector{TransitionResult{T}},
-        final_marking::Marking{T},
+        finalMarking::Marking{T},
     ) where {T<:AbstractToken}
-        new{T}(run_key, status, error, terminal_reason, trace, final_marking)
+        new{T}(runKey, status, error, reason, trace, finalMarking)
     end
 end
 
 """
-    Emitted once per run_key when the engine finishes processing it
+    Emitted once per runKey when the engine finishes processing it
 """
 struct RunFinished{T<:AbstractToken} <: EngineEvent
     result::RunResult{T}
