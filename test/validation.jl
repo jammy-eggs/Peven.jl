@@ -81,13 +81,59 @@ end
     end
 
     @testset "reachability" begin
-        net = toyNet(extraTransitions=Dict(:score => Transition(:score)))
+        net = Net(
+            Dict(
+                :ready => Place(:ready, 2),
+                :done => Place(:done),
+                :other => Place(:other),
+                :sink => Place(:sink),
+            ),
+            Dict(:judge => Transition(:judge), :score => Transition(:score)),
+            [ArcFrom(:judge, :ready), ArcFrom(:score, :other)],
+            [ArcTo(:judge, :done), ArcTo(:score, :sink)],
+        )
         marking = Marking(Dict(
             :ready => Token[Token(:redteam, "r1", 1)],
         ))
 
         issues = validate(net, marking)
         @test any(i -> i.code === :unreachableTransition && i.objectId === :score, issues)
+    end
+
+    @testset "transitions with no input arcs are invalid" begin
+        net = Net(
+            Dict(:done => Place(:done)),
+            Dict(:judge => Transition(:judge)),
+            ArcFrom[],
+            [ArcTo(:judge, :done)],
+        )
+
+        issues = validate(net)
+        @test any(i -> i.code === :missingInputArc && i.objectId === :judge, issues)
+    end
+
+    @testset "duplicate input arcs are invalid" begin
+        net = Net(
+            Dict(:ready => Place(:ready), :done => Place(:done)),
+            Dict(:judge => Transition(:judge)),
+            [ArcFrom(:judge, :ready), ArcFrom(:judge, :ready)],
+            [ArcTo(:judge, :done)],
+        )
+
+        issues = validate(net)
+        @test any(i -> i.code === :duplicateInputArc && i.objectId === :judge, issues)
+    end
+
+    @testset "duplicate output arcs are invalid" begin
+        net = Net(
+            Dict(:ready => Place(:ready), :done => Place(:done)),
+            Dict(:judge => Transition(:judge)),
+            [ArcFrom(:judge, :ready)],
+            [ArcTo(:judge, :done), ArcTo(:judge, :done)],
+        )
+
+        issues = validate(net)
+        @test any(i -> i.code === :duplicateOutputArc && i.objectId === :judge, issues)
     end
 end
 

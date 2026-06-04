@@ -1,11 +1,18 @@
 """
     Executors run the actual work for a Transition (LLM call, tool, judge)
-    Subtype AbstractExecutor and extend Peven.execute(executor, tid, tokens) to use your own.
+    Subtype AbstractExecutor and extend Peven.execute(executor, ctx) to use your own.
     Executors may return one token or a vector of tokens.
 """
 abstract type AbstractExecutor end
 
-execute(e::AbstractExecutor, tid::Symbol, tokens::Vector{<:AbstractToken}) =
+struct ExecutionContext{T<:AbstractToken}
+    bundle::Bundle
+    firingId::Int
+    attempt::Int
+    inputs::Dict{Symbol, Vector{T}}
+end
+
+execute(e::AbstractExecutor, ctx::ExecutionContext) =
     error("implement execute(::$(typeof(e)), ...)")
 
 const registry = Dict{Symbol, AbstractExecutor}()
@@ -19,6 +26,11 @@ registerExec!(name::Symbol, executor::AbstractExecutor) =
     (registry[name] = executor; nothing)
 
 """
+    Remove a registered executor by name, returning true when one was present
+"""
+unregisterExec!(name::Symbol) = !isnothing(pop!(registry, name, nothing))
+
+"""
     Look up a registered executor by name, throws KeyError if not found
 """
 function getExec(name::Symbol)
@@ -27,10 +39,10 @@ function getExec(name::Symbol)
 end
 
 """
-    Wraps any (tid, tokens) -> token callable as an executor
-    Useful for tests and simple inline executors without defining a struct
+    Wraps any ctx -> token callable as an executor
+    Useful for simple inline executors without defining a struct
 """
 struct FunctionExecutor <: AbstractExecutor
     fn::Function
 end
-execute(e::FunctionExecutor, tid::Symbol, tokens::Vector{<:AbstractToken}) = e.fn(tid, tokens)
+execute(e::FunctionExecutor, ctx::ExecutionContext) = e.fn(ctx)

@@ -32,12 +32,27 @@ struct Transition
     executor::Symbol
     guard::Union{Nothing,Function}
     retries::Int
+    joinBy::Union{Nothing,Function}
 
-    function Transition(id::Symbol, executor::Symbol=:default; guard=nothing, retries::Int=0)
+    function Transition(id::Symbol, executor::Symbol=:default; guard=nothing, retries::Int=0, joinBy=nothing)
         retries >= 0 || throw(ArgumentError("retries must be non-negative"))
-        new(id, executor, guard, retries)
+        new(id, executor, guard, retries, joinBy)
     end
 end
+
+struct Bundle
+    transitionId::Symbol
+    runKey::String
+    selectedKey::Any
+end
+
+Base.:(==)(a::Bundle, b::Bundle) =
+    a.transitionId === b.transitionId &&
+    a.runKey == b.runKey &&
+    isequal(a.selectedKey, b.selectedKey)
+Base.isequal(a::Bundle, b::Bundle) = a == b
+Base.hash(b::Bundle, h::UInt) =
+    hash((b.transitionId, b.runKey, b.selectedKey), h)
 
 """
     Arcs connect Places and Transitions
@@ -51,10 +66,11 @@ struct ArcFrom <: AbstractArc
     transition::Symbol
     from::Symbol
     weight::Int
+    optional::Bool
 
-    function ArcFrom(transition::Symbol, from::Symbol, weight::Int=1)
+    function ArcFrom(transition::Symbol, from::Symbol, weight::Int=1; optional::Bool=false)
         weight > 0 || throw(ArgumentError("Arc weight must be positive"))
-        new(transition, from, weight)
+        new(transition, from, weight, optional)
     end
 end
 
@@ -92,12 +108,15 @@ end
     :judge => [(:ready, 2)] means :judge needs 2 tokens from :ready to fire
 """
 function buildInputArcs(transitions, arcsfrom)
-    inputs = Dict{Symbol,Vector{Tuple{Symbol,Int}}}()
+    inputs = Dict{Symbol,Vector{Tuple{Symbol,Int,Bool}}}()
     for tid in keys(transitions)
-        inputs[tid] = Tuple{Symbol,Int}[]
+        inputs[tid] = Tuple{Symbol,Int,Bool}[]
     end
     for arc in arcsfrom
-        push!(get!(() -> Tuple{Symbol,Int}[], inputs, arc.transition), (arc.from, arc.weight))
+        push!(
+            get!(() -> Tuple{Symbol,Int,Bool}[], inputs, arc.transition),
+            (arc.from, arc.weight, arc.optional),
+        )
     end
     return inputs
 end
@@ -155,7 +174,7 @@ function buildUpstream(transitions, inputArcs, affected)
     rivals = Dict{Symbol,Vector{Symbol}}()
     for tid in keys(transitions)
         seen = Set{Symbol}()
-        for (pid, _) in inputArcs[tid]
+        for (pid, _, _) in inputArcs[tid]
             for rival in get(affected, pid, Symbol[])
                 rival == tid || push!(seen, rival)
             end
@@ -183,7 +202,7 @@ end
     Net is the complete Petri net graph — Places, Transitions, and Arcs
     Caches indexes at construction for fast runtime access:
       children:               adjacency list for reachability checks
-      inputArcs:             Transition -> [(Place, weight)] for consumption
+      inputArcs:             Transition -> [(Place, weight, optional)] for consumption
       outputArcs:            Transition -> [(Place, weight)] for deposit
       affectedTransitions:   Place -> [Transitions] reverse index (building block)
       upstream:               Transition -> [input-side contender transitions] that might lose
@@ -198,7 +217,7 @@ struct Net
     arcsfrom::Vector{ArcFrom}
     arcsto::Vector{ArcTo}
     children::Dict{Symbol,Vector{Symbol}}
-    inputArcs::Dict{Symbol,Vector{Tuple{Symbol,Int}}}
+    inputArcs::Dict{Symbol,Vector{Tuple{Symbol,Int,Bool}}}
     outputArcs::Dict{Symbol,Vector{Tuple{Symbol,Int}}}
     affectedTransitions::Dict{Symbol,Vector{Symbol}}
     upstream::Dict{Symbol,Vector{Symbol}}

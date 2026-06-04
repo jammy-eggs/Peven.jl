@@ -9,20 +9,15 @@ abstract type EngineEvent end
     inputs contains the tokens reserved for this firing
 """
 struct TransitionStarted{T<:AbstractToken} <: EngineEvent
-    transitionId::Symbol
-    runKey::String
-    firingId::Int
-    attempt::Int
-    inputs::Vector{T}
+    ctx::ExecutionContext{T}
 end
 
 """
     Emitted when a transition completes successfully
-    outputs contains the executor's pre-fan-out outputs
+    outputs contains the executor's returned tokens
 """
 struct TransitionCompleted{T<:AbstractToken} <: EngineEvent
-    transitionId::Symbol
-    runKey::String
+    bundle::Bundle
     firingId::Int
     attempt::Int
     outputs::Vector{T}
@@ -33,8 +28,7 @@ end
     retrying is true if the firing will be re-attempted, false if retries are exhausted
 """
 struct TransitionFailed <: EngineEvent
-    transitionId::Symbol
-    runKey::String
+    bundle::Bundle
     firingId::Int
     attempt::Int
     error::String
@@ -46,6 +40,14 @@ end
     Guard exceptions are scheduler observations, not launched firings.
 """
 struct GuardErrored <: EngineEvent
+    bundle::Bundle
+    error::String
+end
+
+"""
+    Emitted when joinBy throws or returns nothing before a bundle can be formed.
+"""
+struct SelectionErrored <: EngineEvent
     transitionId::Symbol
     runKey::String
     error::String
@@ -57,12 +59,11 @@ end
 """
     Record of a terminal transition outcome kept in a run trace
     status is :completed or :failed
-    outputs holds the executor's pre-fan-out outputs on success, error holds the message on failure
+    outputs holds the executor's returned tokens on success, error holds the message on failure
     Failed entries capture launched firings that ended in terminal failure
 """
 struct TransitionResult{T<:AbstractToken}
-    transitionId::Symbol
-    runKey::String
+    bundle::Bundle
     firingId::Int
     status::Symbol
     outputs::Vector{T}
@@ -70,15 +71,14 @@ struct TransitionResult{T<:AbstractToken}
     attempts::Int
 
     function TransitionResult(
-        transitionId::Symbol,
-        runKey::String,
+        bundle::Bundle,
         firingId::Int,
         status::Symbol,
         outputs::Vector{T},
         error::Union{Nothing, String},
         attempts::Int,
     ) where {T<:AbstractToken}
-        new{T}(transitionId, runKey, firingId, status, outputs, error, attempts)
+        new{T}(bundle, firingId, status, outputs, error, attempts)
     end
 end
 

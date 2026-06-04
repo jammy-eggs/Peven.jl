@@ -23,16 +23,29 @@ using Main.Peven
         @test t.executor === :default
         @test isnothing(t.guard)
         @test t.retries == 0
+        @test isnothing(t.joinBy)
 
         t2 = Transition(:judge, :agent; retries=2)
         @test t2.executor === :agent
         @test t2.retries == 2
 
         guardFn = tokens -> length(tokens) > 0
-        t3 = Transition(:gate, :default; guard=guardFn)
+        joinFn = (pid, token) -> token.payload.item
+        t3 = Transition(:gate, :default; guard=guardFn, joinBy=joinFn)
         @test t3.guard === guardFn
+        @test t3.joinBy === joinFn
 
         @test_throws ArgumentError Transition(:bad; retries=-1)
+    end
+
+    @testset "Bundle" begin
+        a = Bundle(:judge, "r1", :item1)
+        b = Bundle(:judge, "r1", :item1)
+        c = Bundle(:judge, "r1", :item2)
+
+        @test a == b
+        @test a != c
+        @test length(Set([a, b, c])) == 2
     end
 
     @testset "ArcFrom" begin
@@ -40,9 +53,19 @@ using Main.Peven
         @test arc.transition === :judge
         @test arc.from === :ready
         @test arc.weight == 1
+        @test arc.optional == false
 
         weighted = ArcFrom(:judge, :ready, 3)
         @test weighted.weight == 3
+        @test weighted.optional == false
+
+        optional = ArcFrom(:judge, :advice; optional=true)
+        @test optional.weight == 1
+        @test optional.optional == true
+
+        weightedOptional = ArcFrom(:judge, :advice, 2; optional=true)
+        @test weightedOptional.weight == 2
+        @test weightedOptional.optional == true
 
         @test_throws ArgumentError ArcFrom(:judge, :ready, 0)
         @test_throws ArgumentError ArcFrom(:judge, :ready, -1)
@@ -93,10 +116,10 @@ using Main.Peven
         @test length(net.inputArcs[:t1]) == 2
         @test isempty(net.inputArcs[:t2])
 
-        # Check tuples contain (placeId, weight)
+        # Check tuples contain (placeId, weight, optional)
         t1Inputs = Set(net.inputArcs[:t1])
-        @test (:a, 1) ∈ t1Inputs
-        @test (:b, 2) ∈ t1Inputs
+        @test (:a, 1, false) ∈ t1Inputs
+        @test (:b, 2, false) ∈ t1Inputs
 
         # outputArcs: t1 and t2 each have one output to :c
         @test net.outputArcs[:t1] == [(:c, 1)]

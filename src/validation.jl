@@ -17,10 +17,10 @@ end
     validate(net, marking) checks structure, then marking, then reachability
     Returns a Vector{ValidationIssue} where empty means valid
 """
-validate(net::Net) = validate!(newIssues(net), net)
+validate(net::Net) = validate!(ValidationIssue[], net)
 
 function validate(net::Net, marking::Marking)
-    validate!(newIssues(net, marking), net, marking)
+    validate!(ValidationIssue[], net, marking)
 end
 
 # ── Validation pipeline ─────────────────────────────────────────────────────
@@ -31,6 +31,8 @@ end
 function validate!(issues::Vector{ValidationIssue}, net::Net)
     validateKeys!(issues, net)
     validateArcs!(issues, net)
+    rejectDuplicateArcs!(issues, net)
+    validateInputArcs!(issues, net)
     validateOrphanPlaces!(issues, net)
     return issues
 end
@@ -48,23 +50,6 @@ function validate!(issues::Vector{ValidationIssue}, net::Net, marking::Marking)
 end
 
 # ── Internal helpers ─────────────────────────────────────────────────────────
-
-# Pre-allocate issue vector based on worst case — every element could have a problem
-issueCapacity(net::Net) = (
-    length(net.places) +
-    length(net.transitions) +
-    2 * length(net.arcsfrom) +
-    2 * length(net.arcsto)
-)
-
-issueCapacity(net::Net, marking::Marking) = (
-    issueCapacity(net) +
-    length(marking.tokensByPlace) +
-    1
-)
-
-newIssues(x) = sizehint!(ValidationIssue[], issueCapacity(x))
-newIssues(net::Net, marking::Marking) = sizehint!(ValidationIssue[], issueCapacity(net, marking))
 
 pushIssue!(
     issues::Vector{ValidationIssue},
@@ -138,11 +123,56 @@ function validate!(issues::Vector{ValidationIssue}, arc::ArcTo, net::Net)
     return issues
 end
 
+function rejectDuplicateArcs!(issues::Vector{ValidationIssue}, net::Net)
+    inputs = Set{Tuple{Symbol,Symbol}}()
+    outputs = Set{Tuple{Symbol,Symbol}}()
+
+    for arc in net.arcsfrom
+        key = (arc.transition, arc.from)
+        if key ∈ inputs
+            pushIssue!(
+                issues,
+                :duplicateInputArc,
+                arc.transition,
+                "transition :$(arc.transition) has multiple input arcs from :$(arc.from); use one weighted ArcFrom",
+            )
+        end
+        push!(inputs, key)
+    end
+
+    for arc in net.arcsto
+        key = (arc.transition, arc.to)
+        if key ∈ outputs
+            pushIssue!(
+                issues,
+                :duplicateOutputArc,
+                arc.transition,
+                "transition :$(arc.transition) has multiple output arcs to :$(arc.to); use one weighted ArcTo",
+            )
+        end
+        push!(outputs, key)
+    end
+
+    return issues
+end
+
+function validateInputArcs!(issues::Vector{ValidationIssue}, net::Net)
+    for tid in keys(net.transitions)
+        isempty(net.inputArcs[tid]) && pushIssue!(
+            issues,
+            :missingInputArc,
+            tid,
+            "transition :$tid has no input arcs",
+        )
+    end
+
+    return issues
+end
+
 # ── Orphan places ────────────────────────────────────────────────────────────
 
 """
-    A Place with no arcs at all is dead weight — nothing can consume from it or deposit into it
-    This is almost always a bug in the net definition
+    A Place with no arcs cannot consume or receive tokens.
 """
 function validateOrphanPlaces!(issues::Vector{ValidationIssue}, net::Net)
     # Places that appear in any arc (as input or output)
@@ -214,7 +244,6 @@ function validateReachability!(issues::Vector{ValidationIssue}, net::Net, markin
         end
     end
 
-    # Any Transition not reached is dead from this Marking
     for id in sort!(collect(keys(net.transitions)))
         id in seen || pushIssue!(issues, :unreachableTransition, id, "transition :$id is unreachable from the current marking")
     end
