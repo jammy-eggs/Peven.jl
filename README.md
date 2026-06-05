@@ -1,8 +1,8 @@
 # Peven.jl
 
-A colored Petri net engine for multi-agent evaluations, written in Julia.
+A colored Petri net engine for executing rollouts in environments, written in Julia.
 
-Peven models evaluation runs as explicit places, transitions, arcs, and tokens. It is for workflows where the shape of interaction matters: who sees what, what can run in parallel, where state waits, and what counts as completion.
+Peven approaches post-training sparse rewards from the environment side: it models an environment as an executable state machine using a Petri net. It lets you define an explicit interaction topology and read the flow of tokens as state changes.
 
 ## Install
 
